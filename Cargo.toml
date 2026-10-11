@@ -1,0 +1,29 @@
+[package]
+name = "gifcore"
+version = "1.0.0"
+edition = "2021"
+description = "Rust core library: video probing, frame access and GIF encoding for the QML front-end"
+license = "MIT"
+
+[lib]
+name = "gifcore"
+# staticlib for linking into the C++/QML front-end; rlib so `cargo test` and the
+# `forge` launcher binary can use the kernel as a normal Rust library.
+crate-type = ["staticlib", "rlib"]
+
+[[bin]]
+# The entry point you press Run on: it brings the kernel up and then starts the
+# C++/QML shell. See src/main.rs.
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+# Intentionally empty: the core is dependency-free so the build works fully
+# offline and produces nothing extra to ship.
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

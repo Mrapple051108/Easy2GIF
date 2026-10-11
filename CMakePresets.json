@@ -1,0 +1,62 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "mingw-release",
+      "displayName": "MinGW Release (Rust kernel + Qt UI)",
+      "description": "Release build with the MinGW toolchain, which the Rust kernel requires because it is compiled for x86_64-pc-windows-gnu. Builds into ./b, the same directory build.ps1 uses.",
+      "generator": "MinGW Makefiles",
+      "binaryDir": "${sourceDir}/b",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "D:/CODE/QT/Tools/mingw1310_64/bin/gcc.exe",
+        "CMAKE_CXX_COMPILER": "D:/CODE/QT/Tools/mingw1310_64/bin/g++.exe",
+        "CMAKE_MAKE_PROGRAM": "D:/CODE/QT/Tools/mingw1310_64/bin/mingw32-make.exe",
+        "CMAKE_PREFIX_PATH": "D:/CODE/QT/6.10.2/mingw_64",
+        "GIFCORE_FFMPEG_EXE": "C:/ProgramData/chocolatey/lib/ffmpeg/tools/ffmpeg/bin/ffmpeg.exe",
+        "GIFCORE_FFPROBE_EXE": "C:/ProgramData/chocolatey/lib/ffmpeg/tools/ffmpeg/bin/ffprobe.exe"
+      },
+      "environment": {
+        "RUSTUP_HOME": "${sourceDir}/.rustup_local",
+        "RUSTUP_TOOLCHAIN": "stable-x86_64-pc-windows-gnu",
+        "PATH": "D:/CODE/QT/Tools/mingw1310_64/bin;D:/CODE/QT/Tools/CMake_64/bin;D:/CODE/QT/6.10.2/mingw_64/bin;$penv{PATH}"
+      }
+    },
+    {
+      "name": "mingw-debug",
+      "inherits": "mingw-release",
+      "displayName": "MinGW Debug",
+      "description": "Same toolchain, debug info kept in both halves. The app runs more slowly but the C++ side can be stepped through.",
+      "binaryDir": "${sourceDir}/b-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "mingw-release",
+      "configurePreset": "mingw-release",
+      "displayName": "Build Easy2GIF"
+    },
+    {
+      "name": "mingw-release-bundle",
+      "configurePreset": "mingw-release",
+      "displayName": "Build the self-contained bundle",
+      "description": "Builds everything and then runs windeployqt plus the ffmpeg copy, producing b/bundle: an executable that needs nothing installed on the target machine.",
+      "targets": [
+        "bundle"
+      ]
+    },
+    {
+      "name": "mingw-debug",
+      "configurePreset": "mingw-debug",
+      "displayName": "Build Easy2GIF (debug)"
+    }
+  ]
+}

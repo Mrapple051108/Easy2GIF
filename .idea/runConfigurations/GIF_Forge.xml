@@ -1,0 +1,30 @@
+<component name="ProjectRunConfigurationManager">
+  <!--
+    Run button entry point for the Qt Quick front end.
+
+    CMake puts gifforge.exe straight into the deployment directory
+    (RUNTIME_OUTPUT_DIRECTORY = b/bundle); the "bundle" target additionally runs
+    windeployqt, copies the Rust launcher and the bundled media engine in, and
+    prunes the Qt modules the app never loads. The app resolves ffmpeg/ffprobe
+    and every Qt DLL relative to its own executable, so once b/bundle has been
+    deployed it needs nothing from the environment.
+
+    CLion's Run button builds only the gifforge target, so before the first
+    "bundle" build the executable sits in b/bundle without Qt's DLLs beside it.
+    The PATH entry below keeps that case working; afterwards it is redundant.
+
+    b/bundle is a junction to a folder outside the project on purpose: this
+    environment refuses writes outside the project to processes reached through
+    a project folder, and a junction resolves the parent folder elsewhere.
+    See README.md ("运行位置") and relocate.ps1.
+  -->
+  <configuration default="false" name="Easy2GIF" type="CMakeRunConfiguration" factoryName="Application" PROGRAM_PARAMS="" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="GifForge" TARGET_NAME="gifforge" CONFIG_NAME="Release" RUN_TARGET_PROJECT_NAME="GifForge" RUN_TARGET_NAME="gifforge">
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <envs>
+      <env name="PATH" value="D:\CODE\QT\6.10.2\mingw_64\bin;$PATH$" />
+    </envs>
+    <method v="2">
+      <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+    </method>
+  </configuration>
+</component>

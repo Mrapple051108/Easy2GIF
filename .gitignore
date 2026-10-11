@@ -1,0 +1,20 @@
+# 构建产物
+/target/
+/b/
+/gifcore-tmp/
+
+# 装在项目里的本地 Rust 工具链（约 840 MB，绝不入库）
+/.rustup_local/
+
+# 探针、截图和临时文件
+/.probe/
+*.part
+*.log
+
+# IDE 本地状态（.idea 下的运行配置是提交的，见 .idea/.gitignore）
+/.idea/shelf/
+/.idea/editor.xml
+/.idea/claudeCodeTabState.xml
+
+# 只是为了绕过本机沙箱的临时工具
+/tools/proxy.js
