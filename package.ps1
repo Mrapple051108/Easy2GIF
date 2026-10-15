@@ -25,11 +25,11 @@ if (!$SkipBuild) {
     }
     & (Join-Path $root 'build.ps1') @buildArgs
 }
-foreach ($rel in @('easy2gif.exe', 'forge.exe', 'qt.conf', 'bin\media-runtime.txt')) {
+foreach ($rel in @('easy2gif.exe', 'qt.conf', 'bin\media-runtime.txt')) {
     if (!(Test-Path (Join-Path $bundle $rel))) { throw "Missing bundle file: $rel" }
 }
 & (Join-Path $root 'tools\test-app-icons.ps1') `
-    -Executable @((Join-Path $bundle 'easy2gif.exe'), (Join-Path $bundle 'forge.exe')) `
+    -Executable (Join-Path $bundle 'easy2gif.exe') `
     -Icon (Join-Path $root 'app\assets\easy2gif.ico')
 $commit = (& git -C $root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot determine source revision.' }
@@ -37,14 +37,16 @@ $dirty = [bool](& git -C $root status --porcelain --untracked-files=normal)
 $suffix = if ($dirty) { '-dirty' } else { '' }
 $name = "easy2gif-1.0.0-windows-x64-$($commit.Substring(0,7))$suffix"
 $stage = Join-Path $root ('.probe\package-' + [guid]::NewGuid().ToString('N'))
-$app = Join-Path $stage 'easy2gif'
+# A new release gets a new executable path, so Explorer does not reuse the
+# cached icon of a previous release extracted into the same destination.
+$app = Join-Path $stage $name
 $output = Join-Path $root 'b\releases'
 New-Item -ItemType Directory -Force -Path $app, (Join-Path $app 'bin'), (Join-Path $app 'licenses'), $output | Out-Null
 
 # Start from a fresh directory. Include only runtime files, never scratch data
 # or executables left behind by an earlier target name.
 Get-ChildItem -LiteralPath $bundle -Filter '*.dll' -File | Copy-Item -Destination $app
-foreach ($file in @('easy2gif.exe', 'forge.exe', 'qt.conf')) {
+foreach ($file in @('easy2gif.exe', 'qt.conf')) {
     Copy-Item -LiteralPath (Join-Path $bundle $file) -Destination $app
 }
 foreach ($dir in @('qml', 'platforms', 'iconengines', 'imageformats', 'networkinformation', 'tls')) {
@@ -108,7 +110,7 @@ if (!$SevenZipOnly) {
 if ($SevenZip -or $SevenZipOnly) {
     $seven = Join-Path $output "$name.7z"
     if (Test-Path $seven) { throw "Archive already exists: $seven" }
-    & $tar -a -cf $seven -C $stage easy2gif
+    & $tar -a -cf $seven -C $stage $name
     if ($LASTEXITCODE -ne 0) { throw '7z packaging failed.' }
     $archives += $seven
 }

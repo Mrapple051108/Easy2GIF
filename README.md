@@ -27,12 +27,12 @@ Easy2GIF 是一款适用于 **Windows x64** 的视频转 GIF 工具。预览画�
 
 ## 开始使用
 
-1. 将 Windows x64 版本的 ZIP 或 7z 压缩包**完整解压**到一个文件夹。
+1. 将 Windows x64 版本的 7z 压缩包**完整解压**，打开带版本号的程序文件夹。
 2. 运行 `easy2gif.exe`，点击右上角「打开视频」，或按 `Ctrl+O` 导入。
 3. 通过时间轴或「开始」「结束」输入框选取要转换的片段。
 4. 调整导出设置，选择保存文件夹与文件名，点击「导出 GIF」。
 
-请保留程序目录中的 `bin`、`qml` 和 DLL 文件，它们是运行所需的组件。
+`easy2gif.exe` 是唯一的应用入口，已包含转换内核。请保留程序目录中的 `bin`、`qml` 和 DLL 文件，它们是运行所需的组件。
 
 ### 选择片段
 
@@ -105,8 +105,7 @@ rustup toolchain install stable-x86_64-pc-windows-gnu
 构建产物位于 `b\bundle`。生成发布压缩包：
 
 ```powershell
-.\package.ps1 -SkipBuild              # 将已构建的程序打成 ZIP
-.\package.ps1 -SharedMedia -SevenZip   # 构建并生成 ZIP、7z
+.\package.ps1 -SkipBuild -SevenZipOnly # 将已构建的程序打成 7z
 .\package.ps1 -SharedMedia -SevenZipOnly # 构建并只生成 7z
 ```
 
