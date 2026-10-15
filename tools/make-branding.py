@@ -7,18 +7,56 @@ ASSETS = ROOT / "app/assets"
 BRAND = ROOT / "docs/brand"
 PRIMARY = "#6264dd"
 MINT = "#8de7d4"
-E_POINTS = [(64, 64), (160, 64), (160, 92), (92, 92), (92, 114),
-            (138, 114), (138, 142), (92, 142), (92, 164), (160, 164),
-            (160, 192), (64, 192)]
-PLAY_POINTS = [(160, 104), (200, 128), (160, 152)]
+E_PATH = [('M', 38, 72), ('H', 98), ('V', 94), ('H', 59), ('V', 117),
+          ('H', 91), ('V', 139), ('H', 59), ('V', 162), ('H', 98),
+          ('V', 184), ('H', 38), ('Z',)]
+PLAY_PATH = [('M', 113, 106), ('L', 141, 126), ('Q', 144, 128, 141, 130),
+             ('L', 113, 150), ('Q', 110, 152, 110, 148), ('V', 108),
+             ('Q', 110, 104, 113, 106), ('Z',)]
+G_PATH = [('M', 218, 101), ('C', 214, 80, 201, 70, 184, 70),
+          ('C', 160, 70, 148, 87, 148, 112), ('V', 144),
+          ('C', 148, 171, 160, 186, 184, 186),
+          ('C', 204, 186, 219, 172, 219, 151), ('V', 127), ('H', 183),
+          ('V', 148), ('H', 198), ('V', 153),
+          ('C', 198, 162, 193, 167, 185, 167),
+          ('C', 174, 167, 169, 160, 169, 144), ('V', 112),
+          ('C', 169, 96, 173, 89, 183, 89),
+          ('C', 191, 89, 196, 93, 198, 102), ('Z',)]
+SHAPES = [(E_PATH, '#ffffff'), (PLAY_PATH, MINT), (G_PATH, '#ffffff')]
 
 
 def mark_svg():
-    points = lambda items: " ".join(f"{x},{y}" for x, y in items)
-    return (f'<rect x="8" y="8" width="240" height="240" rx="62" fill="{PRIMARY}"/>'
-            f'<polygon points="{points(E_POINTS)}" fill="#ffffff"/>'
-            f'<polygon points="{points(PLAY_POINTS)}" fill="{MINT}" stroke="{MINT}" '
-            'stroke-width="4" stroke-linejoin="round"/>')
+    body = f'<rect x="8" y="8" width="240" height="240" rx="62" fill="{PRIMARY}"/>'
+    for commands, color in SHAPES:
+        data = ''.join(command[0] + ' '.join(map(str, command[1:])) for command in commands)
+        body += f'<path d="{data}" fill="{color}"/>'
+    return body
+
+
+def outline(commands):
+    """Flatten the shared vector paths for a supersampled Pillow raster."""
+    points = []
+    for op, *values in commands:
+        if op in ('M', 'L'):
+            points.append(tuple(values))
+        elif op == 'H':
+            points.append((values[0], points[-1][1]))
+        elif op == 'V':
+            points.append((points[-1][0], values[0]))
+        elif op in ('Q', 'C'):
+            start = points[-1]
+            controls = [start] + list(zip(values[::2], values[1::2]))
+            # De Casteljau evaluation preserves the exact approved SVG curves.
+            for step in range(1, 65):
+                t = step / 64
+                work = controls[:]
+                while len(work) > 1:
+                    work = [tuple(a * (1 - t) + b * t for a, b in zip(p, q))
+                            for p, q in zip(work, work[1:])]
+                points.append(work[0])
+        elif op == 'Z':
+            points.append(points[0])
+    return points
 
 
 def write_svg(path, width, height, body, label):
@@ -34,12 +72,8 @@ def icon_png():
     draw = ImageDraw.Draw(image)
     draw.rounded_rectangle(tuple(v * scale for v in (8, 8, 248, 248)),
                            radius=62 * scale, fill=PRIMARY)
-    draw.polygon([(x * scale, y * scale) for x, y in E_POINTS], fill="white")
-    points = [(x * scale, y * scale) for x, y in PLAY_POINTS]
-    draw.polygon(points, fill=MINT)
-    draw.line(points + [points[0]], fill=MINT, width=4 * scale, joint="curve")
-    for x, y in points:
-        draw.ellipse((x - 2 * scale, y - 2 * scale, x + 2 * scale, y + 2 * scale), fill=MINT)
+    for commands, color in SHAPES:
+        draw.polygon([(x * scale, y * scale) for x, y in outline(commands)], fill=color)
     return image.resize((512, 512), Image.Resampling.LANCZOS)
 
 
