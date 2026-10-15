@@ -583,7 +583,7 @@ QString GifBridge::selectionFramesText() const
         return QStringLiteral("0");
     }
     return QString::number(
-        static_cast<qulonglong>(gif_estimate_frames(m_core, m_outFps)));
+        static_cast<qulonglong>(gif_estimate_frames_ex(m_core, m_outFps, m_speed)));
 }
 
 QString GifBridge::estimatedFramesText() const
@@ -1042,6 +1042,7 @@ void GifBridge::startExport(const QString &outputPath)
 
     if (m_estimateWorker.joinable()) {
         // A size estimate is decoding through the same kernel handle right now.
+        gif_cancel(m_core);
         // Queue this instead of racing it; publishEstimate() (or onPollTick's
         // safety net) starts it. The poll timer is re-armed here because it is
         // the only path that publishes that estimate.
@@ -1224,6 +1225,10 @@ void GifBridge::scheduleEstimate()
     if (m_exporting || m_startExportWhenIdle) {
         return;
     }
+    ++m_estimateGeneration;
+    if (m_estimateWorker.joinable()) {
+        gif_cancel(m_core);
+    }
     m_estimateTimer.start();
 }
 
@@ -1295,6 +1300,10 @@ void GifBridge::startEstimate()
         {
             std::lock_guard<std::mutex> lock(m_estimateMutex);
             m_estimateResultGeneration = generation;
+            if (generation != m_estimateGeneration.load() || status == GIF_ERR_CANCELLED) {
+                m_estimateDone.store(true);
+                return;
+            }
             if (status == GIF_OK) {
                 m_estimateText = formatBytes(estimate.bytes);
                 m_estimateDetail =
@@ -1331,8 +1340,7 @@ void GifBridge::publishEstimate()
     // The poll timer is not stopped here: onPollTick() owns its lifetime and
     // keeps it alive while an export is queued or still running.
 
-    // A result that arrived after the settings moved is still a real
-    // measurement, so it is shown — and then replaced by a fresh one.
+    // Superseded results are discarded; schedule the newest request after joining.
     bool rearm = false;
     {
         std::lock_guard<std::mutex> lock(m_estimateMutex);

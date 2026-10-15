@@ -5,6 +5,17 @@
 //! which produces noticeably better results than a plain median cut at the
 //! same palette size.
 
+use crate::error::{Error, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> Result<()> {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 /// A palette of up to 256 RGB entries.
 #[derive(Debug, Clone, Default)]
 pub struct Palette {
@@ -70,6 +81,8 @@ impl Palette {
 pub struct ColorMap {
     /// 64*64*64 entries.
     lut: Vec<u8>,
+    exact: std::collections::HashMap<[u8; 3], u8>,
+    exact_cells: Vec<u64>,
 }
 
 impl ColorMap {
@@ -96,11 +109,29 @@ impl ColorMap {
     /// the cube up to four times per export, making this the single largest
     /// serial cost in the pipeline.
     pub fn build_with_threads(palette: &Palette, threads: u32) -> ColorMap {
+        Self::build_cancellable(palette, threads, None).expect("uncancelled colour map")
+    }
+
+    pub fn build_cancellable(
+        palette: &Palette,
+        threads: u32,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ColorMap> {
+        check_cancel(cancel)?;
+        if palette.colors.len() > 256 {
+            return Err(Error::Invalid("palette exceeds 256 colors".into()));
+        }
+        let mut exact = std::collections::HashMap::new();
+        let mut exact_cells = vec![0u64; (Self::SIDE * Self::SIDE * Self::SIDE) / 64];
         let side = Self::SIDE;
         let total = side * side * side;
         let mut lut = vec![0u8; total];
         if palette.colors.is_empty() {
-            return ColorMap { lut };
+            return Ok(ColorMap {
+                lut,
+                exact,
+                exact_cells,
+            });
         }
 
         let shift = Self::BITS;
@@ -111,8 +142,11 @@ impl ColorMap {
         // `(rq * side + gq) * side + bq`, so a contiguous chunk of the flat
         // table is a contiguous block of cells and the base offset is all a
         // worker needs to know.
-        let fill = |base: usize, out: &mut [u8]| {
+        let fill = |base: usize, out: &mut [u8]| -> Result<()> {
             for (i, slot) in out.iter_mut().enumerate() {
+                if i % 256 == 0 {
+                    check_cancel(cancel)?;
+                }
                 let flat = base + i;
                 let rq = flat >> (2 * shift);
                 let gq = (flat >> shift) & mask;
@@ -137,27 +171,51 @@ impl ColorMap {
                 }
                 *slot = best.min(255) as u8;
             }
+            Ok(())
         };
 
         let workers = (threads as usize).max(1).min(total);
         if workers <= 1 {
-            fill(0, &mut lut);
+            fill(0, &mut lut)?;
         } else {
             let chunk = total.div_ceil(workers);
-            std::thread::scope(|scope| {
+            std::thread::scope(|scope| -> Result<()> {
+                let mut handles = Vec::new();
                 for (i, part) in lut.chunks_mut(chunk).enumerate() {
                     let base = i * chunk;
-                    scope.spawn(move || fill(base, part));
+                    handles.push(scope.spawn(move || fill(base, part)));
                 }
-            });
+                for handle in handles {
+                    handle
+                        .join()
+                        .map_err(|_| Error::Encode("colour map worker panicked".into()))??;
+                }
+                Ok(())
+            })?;
         }
 
-        ColorMap { lut }
+        for (i, c) in palette.colors.iter().enumerate() {
+            let key = Self::key(c[0], c[1], c[2]);
+            if lut[key] as usize != i {
+                exact.insert(*c, i as u8);
+                exact_cells[key / 64] |= 1 << (key % 64);
+            }
+        }
+        Ok(ColorMap {
+            lut,
+            exact,
+            exact_cells,
+        })
     }
 
     #[inline]
     pub fn index(&self, r: u8, g: u8, b: u8) -> u8 {
-        self.lut[Self::key(r, g, b)]
+        let key = Self::key(r, g, b);
+        if self.exact_cells[key / 64] & (1 << (key % 64)) != 0 {
+            self.exact.get(&[r, g, b]).copied().unwrap_or(self.lut[key])
+        } else {
+            self.lut[key]
+        }
     }
 }
 
@@ -217,7 +275,7 @@ pub fn posterize_levels(lossy: u32) -> u32 {
     if lossy == 0 {
         1
     } else {
-        1 + (lossy * 15) / 100
+        2 + ((100 - lossy) * 254) / 100
     }
 }
 
@@ -248,7 +306,38 @@ pub fn quantize_with_options(
     threads: u32,
     iterations: usize,
 ) -> Palette {
-    let max_colors = max_colors.clamp(2, 256);
+    quantize_cancellable(rgb, max_colors, threads, iterations, None)
+        .expect("uncancelled quantization")
+}
+
+pub fn quantize_cancellable(
+    rgb: &[u8],
+    max_colors: usize,
+    threads: u32,
+    iterations: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Palette> {
+    check_cancel(cancel)?;
+    let max_colors = max_colors.clamp(1, 256);
+    // Preserve small exact colour sets, including colours in the same 5-bit bin.
+    let mut exact = std::collections::BTreeSet::new();
+    for (i, px) in rgb.chunks_exact(3).enumerate() {
+        if i % 4096 == 0 {
+            check_cancel(cancel)?;
+        }
+        exact.insert([px[0], px[1], px[2]]);
+        if exact.len() > max_colors {
+            break;
+        }
+    }
+    if exact.len() <= max_colors {
+        let mut colors: Vec<_> = exact.into_iter().collect();
+        if colors.is_empty() {
+            colors.push([0, 0, 0]);
+        }
+        colors.sort_by_key(|c| c[0] as u32 * 299 + c[1] as u32 * 587 + c[2] as u32 * 114);
+        return Ok(Palette { colors });
+    }
 
     // 33^3 tables over the 5-bit-per-channel histogram. Index 0 is a zero
     // border so inclusive prefix sums can be taken with simple recurrences.
@@ -263,9 +352,20 @@ pub fn quantize_with_options(
     let mut lo = [32i32, 32, 32];
     let mut hi = [0i32, 0, 0];
     let mut any = false;
-    for px in rgb.chunks_exact(3) {
-        let (r5, g5, b5) = ((px[0] >> 3) as usize, (px[1] >> 3) as usize, (px[2] >> 3) as usize);
-        let (r5x, g5x, b5x) = ((px[0] >> 3) as i32, (px[1] >> 3) as i32, (px[2] >> 3) as i32);
+    for (pi, px) in rgb.chunks_exact(3).enumerate() {
+        if pi % 4096 == 0 {
+            check_cancel(cancel)?;
+        }
+        let (r5, g5, b5) = (
+            (px[0] >> 3) as usize,
+            (px[1] >> 3) as usize,
+            (px[2] >> 3) as usize,
+        );
+        let (r5x, g5x, b5x) = (
+            (px[0] >> 3) as i32,
+            (px[1] >> 3) as i32,
+            (px[2] >> 3) as i32,
+        );
         lo = [lo[0].min(r5x), lo[1].min(g5x), lo[2].min(b5x)];
         hi = [hi[0].max(r5x), hi[1].max(g5x), hi[2].max(b5x)];
         any = true;
@@ -280,9 +380,9 @@ pub fn quantize_with_options(
     }
 
     if !any {
-        return Palette {
+        return Ok(Palette {
             colors: vec![[0, 0, 0]],
-        };
+        });
     }
 
     // Build an inclusive 3-D prefix sum, one axis at a time, in place.
@@ -377,6 +477,7 @@ pub fn quantize_with_options(
     // Repeatedly split the box whose error is largest. A box with a zero extent
     // on every axis is one colour and cannot be cut further.
     loop {
+        check_cancel(cancel)?;
         if boxes.len() >= max_colors {
             break;
         }
@@ -397,40 +498,29 @@ pub fn quantize_with_options(
         };
 
         let b = boxes[bi];
-        // Split along the axis with the largest extent.
-        let mut axis = 0usize;
-        let mut ext = b.hi[0] - b.lo[0];
-        for a in 1..3 {
-            let e = b.hi[a] - b.lo[a];
-            if e > ext {
-                ext = e;
-                axis = a;
-            }
-        }
-        if ext < 1 {
-            break;
-        }
-
-        // Find the cut position that minimises the combined variance. The cut
-        // splits the inclusive range into `[lo, cut]` and `[cut + 1, hi]`.
-        let mut best_cut = b.lo[axis];
+        // Compare all axes, ignoring cuts that create an empty box.
+        let mut best = None;
         let mut best_sum = f64::INFINITY;
-        let mut lo_box = b;
-        let mut hi_box = b;
-        for cut in b.lo[axis]..b.hi[axis] {
-            lo_box.hi[axis] = cut;
-            hi_box.lo[axis] = cut + 1;
-            let s = variance(&lo_box) + variance(&hi_box);
-            if s < best_sum {
-                best_sum = s;
-                best_cut = cut;
+        for axis in 0..3 {
+            for cut in b.lo[axis]..b.hi[axis] {
+                let (mut left, mut right) = (b, b);
+                left.hi[axis] = cut;
+                right.lo[axis] = cut + 1;
+                if count_of(&left) <= 0.0 || count_of(&right) <= 0.0 {
+                    continue;
+                }
+                let score = variance(&left) + variance(&right);
+                if score < best_sum {
+                    best_sum = score;
+                    best = Some((left, right));
+                }
             }
         }
-
-        hi_box.lo[axis] = best_cut + 1;
-        lo_box.hi[axis] = best_cut;
-        boxes[bi] = lo_box;
-        boxes.push(hi_box);
+        let Some((left, right)) = best else {
+            break;
+        };
+        boxes[bi] = left;
+        boxes.push(right);
     }
 
     // Average colour of each box, weighted by pixel count.
@@ -452,10 +542,10 @@ pub fn quantize_with_options(
         colors.push([0, 0, 0]);
     }
 
-    improve_with_kmeans(&mut colors, rgb, threads, iterations);
+    improve_with_kmeans(&mut colors, rgb, threads, iterations, cancel)?;
     sort_palette(&mut colors, &mut weights);
 
-    Palette { colors }
+    Ok(Palette { colors })
 }
 
 /// A few Lloyd iterations pull each palette entry onto the centroid of the
@@ -464,30 +554,35 @@ pub fn quantize_with_options(
 /// This is where the 「编码质量」 setting lands: more iterations cost time in
 /// this serial pass and buy accuracy. The loop stops early once nothing moves,
 /// so a high count is not automatically a slow one.
-fn improve_with_kmeans(colors: &mut [[u8; 3]], rgb: &[u8], threads: u32, iterations: usize) {
-    if colors.len() < 2 {
-        return;
+fn improve_with_kmeans(
+    colors: &mut [[u8; 3]],
+    rgb: &[u8],
+    threads: u32,
+    iterations: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    if colors.len() < 2 || iterations == 0 {
+        return Ok(());
     }
 
     let iter = iterations.min(64);
     let cube = |c: &[[u8; 3]]| {
-        ColorMap::build_with_threads(
-            &Palette {
-                colors: c.to_vec(),
-            },
-            threads,
-        )
+        ColorMap::build_cancellable(&Palette { colors: c.to_vec() }, threads, cancel)
     };
-    let mut cm = cube(colors);
+    let mut cm = cube(colors)?;
 
-    for _ in 0..iter {
+    for iteration in 0..iter {
+        check_cancel(cancel)?;
         // Deliberately serial. Splitting this sum across workers would change
         // the order of the floating-point additions, so the palette — and with
         // it every byte of the output — would stop being reproducible for a
         // given input, and threading belongs in the cube build, which is
         // integer-only and therefore identical however it is split.
         let mut acc = vec![[0f64; 4]; colors.len()];
-        for px in rgb.chunks_exact(3) {
+        for (pi, px) in rgb.chunks_exact(3).enumerate() {
+            if pi % 4096 == 0 {
+                check_cancel(cancel)?;
+            }
             let i = cm.index(px[0], px[1], px[2]) as usize;
             if i >= acc.len() {
                 continue;
@@ -513,8 +608,11 @@ fn improve_with_kmeans(colors: &mut [[u8; 3]], rgb: &[u8], threads: u32, iterati
         if !moved {
             break;
         }
-        cm = cube(colors);
+        if iteration + 1 < iter {
+            cm = cube(colors)?;
+        }
     }
+    Ok(())
 }
 
 /// Order the palette by luminance so consecutive GIF frames share long runs of
@@ -529,6 +627,24 @@ fn sort_palette(colors: &mut [[u8; 3]], weights: &mut [f64]) {
     for (i, (c, w)) in pairs.into_iter().enumerate() {
         colors[i] = c;
         weights[i] = w;
+    }
+}
+
+/// Ordered 4x4 Bayer dithering. Strength zero is identical to plain mapping.
+pub fn map_frame_ordered_with(
+    cm: &ColorMap,
+    rgb: &[u8],
+    w: usize,
+    strength: f64,
+    out: &mut Vec<u8>,
+) {
+    const BAYER: [[u8; 4]; 4] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
+    out.clear();
+    out.reserve(rgb.len() / 3);
+    for (i, px) in rgb.chunks_exact(3).enumerate() {
+        let offset = (BAYER[(i / w) % 4][i % w % 4] as f64 - 7.5) * 4.0 * strength.clamp(0.0, 1.0);
+        let channel = |v: u8| (v as f64 + offset).round().clamp(0.0, 255.0) as u8;
+        out.push(cm.index(channel(px[0]), channel(px[1]), channel(px[2])));
     }
 }
 
@@ -780,11 +896,11 @@ mod tests {
     #[test]
     fn posterising_quantises_the_grid() {
         assert_eq!(posterize_levels(0), 1, "zero means untouched");
-        assert!(posterize_levels(100) > posterize_levels(50));
+        assert!(posterize_levels(100) < posterize_levels(50));
         let mut px = vec![0u8, 1, 2, 253, 254, 255];
         posterize_in_place(&mut px, 1);
         assert_eq!(px, vec![0, 1, 2, 253, 254, 255], "one level is a no-op");
-        assert_eq!(posterize_levels(100), 16);
+        assert_eq!(posterize_levels(100), 2);
     }
 
     #[test]
@@ -797,5 +913,43 @@ mod tests {
         assert_eq!(out.len(), w * h);
         let max = p.colors.len() as u8 - 1;
         assert!(out.iter().all(|&i| i <= max));
+    }
+    #[test]
+    fn lossy_grid_gets_coarser_monotonically_and_exact_palettes_remain_exact() {
+        let mut previous = 256;
+        for lossy in 1..=100 {
+            let levels = posterize_levels(lossy);
+            assert!(levels <= previous);
+            previous = levels;
+            let mut values: Vec<u8> = (0..=255).collect();
+            posterize_in_place(&mut values, levels);
+            values.dedup();
+            assert_eq!(values.len(), levels as usize);
+        }
+        let p = quantize(&[0, 0, 0, 1, 1, 1, 4, 4, 4], 256);
+        assert_eq!(p.colors.len(), 3);
+        let map = ColorMap::build(&p);
+        for c in &p.colors {
+            assert_eq!(p.colors[map.index(c[0], c[1], c[2]) as usize], *c);
+        }
+    }
+
+    #[test]
+    fn quantization_and_colour_map_respect_cancellation() {
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            quantize_cancellable(&[0, 0, 0], 2, 1, 20, Some(&cancel)),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            ColorMap::build_cancellable(
+                &Palette {
+                    colors: vec![[0, 0, 0]]
+                },
+                1,
+                Some(&cancel)
+            ),
+            Err(Error::Cancelled)
+        ));
     }
 }

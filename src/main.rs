@@ -183,7 +183,11 @@ fn main() {
     println!(
         "  外壳      {}{}",
         shell.display(),
-        if published { "（已发布副本）" } else { "（项目内，就地启动）" }
+        if published {
+            "（已发布副本）"
+        } else {
+            "（项目内，就地启动）"
+        }
     );
     if !forwarded.is_empty() {
         println!("  参数      {}", forwarded.join(" "));
@@ -350,12 +354,12 @@ fn bring_up_kernel(probe: Option<&Path>, engine_dir: Option<&Path>) -> bool {
         CString::new(tools.ffmpeg.to_string_lossy().as_bytes()),
         CString::new(tools.ffprobe.to_string_lossy().as_bytes()),
     ) {
-        ffi::gif_set_ffmpeg_path(handle, ffmpeg.as_ptr());
-        ffi::gif_set_ffprobe_path(handle, ffprobe.as_ptr());
+        unsafe { ffi::gif_set_ffmpeg_path(handle, ffmpeg.as_ptr()) };
+        unsafe { ffi::gif_set_ffprobe_path(handle, ffprobe.as_ptr()) };
     }
 
     let mut healthy = true;
-    match ffi::gif_check_tools(handle) {
+    match unsafe { ffi::gif_check_tools(handle) } {
         0 => println!("  工具自检  就绪"),
         _ => {
             healthy = false;
@@ -382,7 +386,7 @@ fn bring_up_kernel(probe: Option<&Path>, engine_dir: Option<&Path>) -> bool {
         }
     }
 
-    ffi::gif_destroy(handle);
+    unsafe { ffi::gif_destroy(handle) };
     healthy
 }
 
@@ -523,11 +527,13 @@ fn locate_shell(explicit: Option<&Path>) -> Option<PathBuf> {
 }
 
 fn last_error(handle: *mut ffi::GifCore) -> String {
-    let ptr = ffi::gif_last_error(handle);
+    let ptr = unsafe { ffi::gif_last_error(handle) };
     if ptr.is_null() {
         return "(内核未提供错误信息)".to_string();
     }
-    unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn print_help() {

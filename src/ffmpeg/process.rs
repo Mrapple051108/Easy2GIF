@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
@@ -78,9 +78,8 @@ fn scratch_candidates() -> Vec<PathBuf> {
 /// is probed by creating and then removing a file.
 fn probe_writable(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
-    let probe = dir.join(format!(".gifcore-probe-{}", std::process::id()));
-    std::fs::write(&probe, b"")?;
-    let _ = std::fs::remove_file(&probe);
+    let probe = TempFile::in_dir(dir, "probe")?;
+    drop(probe);
     Ok(())
 }
 
@@ -129,20 +128,29 @@ pub struct TempFile {
 }
 
 impl TempFile {
-    /// Create a unique temp path (the file itself is not created yet).
+    /// Atomically reserve a unique temporary file.
     pub fn new(tag: &str) -> Result<TempFile> {
-        let dir = scratch_dir()?;
-        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = format!(
-            "{}-{}-{}{}",
-            tag,
-            std::process::id(),
-            seq,
-            ".tmp"
-        );
-        Ok(TempFile {
-            path: dir.join(name),
-        })
+        Ok(Self::in_dir(scratch_dir()?, tag)?)
+    }
+
+    pub fn in_dir(dir: &Path, tag: &str) -> std::io::Result<TempFile> {
+        for _ in 0..128 {
+            let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!(".gifcore-{tag}-{}-{seq}.tmp", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(TempFile { path }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "cannot reserve a temporary file",
+        ))
     }
 
     pub fn path(&self) -> &Path {
@@ -194,12 +202,12 @@ impl MediaTools {
         }
     }
 
-    fn run_ffprobe(&self, args: &[OsString]) -> Result<String> {
-        run_capture(&self.ffprobe, args)
-    }
-
     /// Run `ffprobe -show_format -show_streams -of json` and return the JSON.
     pub fn probe_json(&self, input: &Path) -> Result<String> {
+        self.probe_json_cancel(input, None)
+    }
+
+    pub fn probe_json_cancel(&self, input: &Path, cancel: Option<&AtomicBool>) -> Result<String> {
         let args = ffargs![
             "-v",
             "error",
@@ -209,7 +217,28 @@ impl MediaTools {
             "json",
             input.as_os_str()
         ];
-        self.run_ffprobe(&args)
+        capture_cancel(&self.ffprobe, &args, cancel)
+    }
+
+    pub fn frame_times(&self, input: &Path, stream: u32, start: f64, end: f64) -> Result<String> {
+        capture_cancel(
+            &self.ffprobe,
+            &ffargs![
+                "-v",
+                "error",
+                "-select_streams",
+                stream.to_string(),
+                "-read_intervals",
+                format!("{start:.9}%{end:.9}"),
+                "-show_frames",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "json",
+                input.as_os_str()
+            ],
+            None,
+        )
     }
 }
 
@@ -262,43 +291,20 @@ pub(crate) fn quiet_command(program: &OsString) -> Command {
     cmd
 }
 
-fn run_capture(program: &OsString, args: &[OsString]) -> Result<String> {
-    let out = TempFile::new("out")?;
-    let err = TempFile::new("err")?;
-
-    let status = quiet_command(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(out.path())?)
-        .stderr(std::fs::File::create(err.path())?)
-        .status()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                Error::ToolMissing(program.to_string_lossy().into_owned())
-            }
-            _ => Error::Io(e.to_string()),
-        })?;
-
-    let stdout = out.read_all()?;
-    let stderr = err.read_all()?;
-
-    if !status.success() {
-        let detail = String::from_utf8_lossy(&stderr);
-        let detail = detail.trim();
-        let detail = if detail.is_empty() {
-            format!("exit status {status}")
-        } else {
-            // Keep the tail: ffmpeg puts the real reason last.
-            let tail: String = detail.chars().rev().take(600).collect();
-            tail.chars().rev().collect()
-        };
-        return Err(Error::ToolFailed {
-            cmd: describe(program, args),
-            detail,
-        });
-    }
-
-    Ok(String::from_utf8_lossy(&stdout).into_owned())
+fn capture_cancel(
+    program: &OsString,
+    args: &[OsString],
+    cancel: Option<&AtomicBool>,
+) -> Result<String> {
+    let mut bytes = Vec::new();
+    run_ffmpeg_stream_cancel(program, args, 16384, cancel, |part| {
+        if bytes.len() + part.len() > 32 << 20 {
+            return Err(Error::BadMedia("media metadata exceeds 32 MiB".into()));
+        }
+        bytes.extend_from_slice(part);
+        Ok(())
+    })?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Human readable command line for error messages.
@@ -341,33 +347,19 @@ impl FfmpegRun {
 }
 
 /// Run ffmpeg writing raw video to a temp file and returning captured stderr.
-pub fn run_ffmpeg_to_temp(
-    program: &OsString,
-    args: &[OsString],
-    tag: &str,
-) -> Result<FfmpegRun> {
+pub fn run_ffmpeg_to_temp(program: &OsString, args: &[OsString], tag: &str) -> Result<FfmpegRun> {
+    use std::io::Write;
     let stdout = TempFile::new(tag)?;
     let stderr = TempFile::new("err")?;
-
-    let status = quiet_command(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(stdout.path())?)
-        .stderr(std::fs::File::create(stderr.path())?)
-        .status()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                Error::ToolMissing(program.to_string_lossy().into_owned())
-            }
-            _ => Error::Io(e.to_string()),
-        })?;
-
-    let err_text = String::from_utf8_lossy(&stderr.read_all()?).into_owned();
-    let stdout_path = stdout.path().to_path_buf();
+    let mut file = std::fs::File::create(stdout.path())?;
+    let err_text = run_ffmpeg_stream(program, args, 65536, |part| {
+        file.write_all(part)?;
+        Ok(())
+    })?;
     Ok(FfmpegRun {
-        success: status.success(),
+        success: true,
         stderr: err_text,
-        stdout_path,
+        stdout_path: stdout.path().to_path_buf(),
         _stdout: stdout,
         _stderr: stderr,
     })
@@ -375,29 +367,7 @@ pub fn run_ffmpeg_to_temp(
 
 /// Run ffmpeg with no captured output at all, only caring about success.
 pub fn run_ffmpeg_quiet(program: &OsString, args: &[OsString]) -> Result<()> {
-    let err = TempFile::new("err")?;
-    let status = quiet_command(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(std::fs::File::create(err.path())?)
-        .status()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                Error::ToolMissing(program.to_string_lossy().into_owned())
-            }
-            _ => Error::Io(e.to_string()),
-        })?;
-    if !status.success() {
-        let detail = String::from_utf8_lossy(&err.read_all()?).into_owned();
-        let detail = detail.trim();
-        let detail: String = detail.chars().rev().take(600).collect::<String>().chars().rev().collect();
-        return Err(Error::ToolFailed {
-            cmd: describe(program, args),
-            detail,
-        });
-    }
-    Ok(())
+    run_ffmpeg_stream(program, args, 16384, |_| Ok(())).map(|_| ())
 }
 
 /// Run ffmpeg, handing each stdout chunk to `sink` as it arrives.
@@ -409,11 +379,27 @@ pub fn run_ffmpeg_stream<F>(
     program: &OsString,
     args: &[OsString],
     chunk: usize,
+    sink: F,
+) -> Result<String>
+where
+    F: FnMut(&[u8]) -> Result<()>,
+{
+    run_ffmpeg_stream_cancel(program, args, chunk, None, sink)
+}
+
+pub fn run_ffmpeg_stream_cancel<F>(
+    program: &OsString,
+    args: &[OsString],
+    chunk: usize,
+    cancel: Option<&AtomicBool>,
     mut sink: F,
 ) -> Result<String>
 where
     F: FnMut(&[u8]) -> Result<()>,
 {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(Error::Cancelled);
+    }
     let err = TempFile::new("err")?;
     let mut child = quiet_command(program)
         .args(args)
@@ -428,40 +414,89 @@ where
             _ => Error::Io(e.to_string()),
         })?;
 
-    let read_result = {
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Io("no stdout pipe from ffmpeg".into()))?;
-        let mut buf = vec![0u8; chunk.max(1)];
-        let mut res: Result<()> = Ok(());
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Err(e) = sink(&buf[..n]) {
-                        res = Err(e);
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    res = Err(Error::Io(e.to_string()));
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Io("no stdout pipe".into()))?;
+    let child = std::sync::Mutex::new(child);
+    let finished = AtomicBool::new(false);
+    let timed_out = AtomicBool::new(false);
+    let activity = std::sync::Mutex::new(std::time::Instant::now());
+    let read_result = std::thread::scope(|scope| {
+        // A blocked read must be interruptible even when the child produces no frames.
+        scope.spawn(|| {
+            while !finished.load(Ordering::Acquire) {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+                    || activity.lock().unwrap().elapsed().as_secs() >= 120
+                {
+                    timed_out.store(
+                        !cancel.is_some_and(|c| c.load(Ordering::Relaxed)),
+                        Ordering::Relaxed,
+                    );
+                    let _ = child.lock().unwrap().kill();
                     break;
                 }
+                std::thread::park_timeout(std::time::Duration::from_millis(20));
             }
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut buf = vec![0u8; chunk.max(1)];
+            loop {
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err(Error::Cancelled);
+                }
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        *activity.lock().unwrap() = std::time::Instant::now();
+                        sink(&buf[..n])?;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(Error::Io(e.to_string())),
+                }
+            }
+            // Waiting after EOF is also interruptible; never hold the child mutex while waiting.
+            loop {
+                if child.lock().unwrap().try_wait()?.is_some() {
+                    break;
+                }
+                if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    return Err(Error::Cancelled);
+                }
+                std::thread::park_timeout(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        }))
+        .unwrap_or_else(|_| Err(Error::Io("media output consumer panicked".into())));
+        if result.is_err() {
+            let _ = child.lock().unwrap().kill();
         }
-        res
-    };
-
-    let status = child.wait().map_err(|e| Error::Io(e.to_string()))?;
+        finished.store(true, Ordering::Release);
+        result
+    });
+    let status = child.into_inner().unwrap().wait()?;
     let err_text = String::from_utf8_lossy(&err.read_all()?).into_owned();
-
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return Err(Error::Cancelled);
+    }
+    if timed_out.load(Ordering::Relaxed) {
+        return Err(Error::ToolFailed {
+            cmd: describe(program, args),
+            detail: "no output for 120 seconds".into(),
+        });
+    }
     read_result?;
 
     if !status.success() {
         let detail = err_text.trim();
-        let detail: String = detail.chars().rev().take(800).collect::<String>().chars().rev().collect();
+        let detail: String = detail
+            .chars()
+            .rev()
+            .take(800)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         return Err(Error::ToolFailed {
             cmd: describe(program, args),
             detail,
@@ -479,8 +514,7 @@ pub struct DataFile {
 }
 
 impl DataFile {
-    pub fn open(tag: &str, frame_bytes: usize) -> Result<DataFile> {
-        let temp = TempFile::new(tag)?;
+    pub fn open(temp: TempFile, frame_bytes: usize) -> Result<DataFile> {
         let file = std::fs::File::open(temp.path())?;
         Ok(DataFile {
             _temp: temp,
@@ -542,8 +576,8 @@ mod tests {
     /// A path that can never become a directory, because its parent is a file.
     /// That is a portable stand-in for a location we are not allowed to use.
     fn blocked(name: &str) -> (PathBuf, PathBuf) {
-        let root = std::env::temp_dir()
-            .join(format!("gifcore-proc-{}-{}", std::process::id(), name));
+        let root =
+            std::env::temp_dir().join(format!("gifcore-proc-{}-{}", std::process::id(), name));
         let _ = std::fs::remove_file(&root);
         let _ = std::fs::remove_dir_all(&root);
         std::fs::write(&root, b"not a directory").expect("write the blocker file");
@@ -598,7 +632,10 @@ mod tests {
 
         // This message is what the user sees, so it has to say what to do.
         let msg = describe_failures(&failures);
-        assert!(msg.contains("GIFCORE_TEMP"), "should say how to fix it: {msg}");
+        assert!(
+            msg.contains("GIFCORE_TEMP"),
+            "should say how to fix it: {msg}"
+        );
         assert!(msg.contains(&unusable_a.display().to_string()));
         assert!(msg.contains(&unusable_b.display().to_string()));
 

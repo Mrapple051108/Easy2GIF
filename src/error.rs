@@ -4,10 +4,15 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum Error {
+    Cancelled,
+    Busy,
     /// The external media tool could not be located.
     ToolMissing(String),
     /// The external media tool ran but failed.
-    ToolFailed { cmd: String, detail: String },
+    ToolFailed {
+        cmd: String,
+        detail: String,
+    },
     /// Filesystem problem while reading or staging.
     Io(String),
     /// The export could not be written to the requested place. Kept separate
@@ -26,6 +31,8 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::Cancelled => write!(f, "export cancelled"),
+            Error::Busy => write!(f, "the kernel handle is busy"),
             Error::ToolMissing(t) => write!(f, "media tool not found: {t}"),
             Error::ToolFailed { cmd, detail } => write!(f, "{cmd} failed: {detail}"),
             Error::Io(e) => write!(f, "{e}"),

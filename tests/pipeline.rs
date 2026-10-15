@@ -9,10 +9,10 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use gifcore::export::{Progress, Settings, export, planned_frames};
+use gifcore::export::{export, planned_frames, Progress, Settings};
 use gifcore::ffmpeg::probe;
 use gifcore::ffmpeg::process::MediaTools;
 use gifcore::gif::Dither;
@@ -126,12 +126,21 @@ fn decode_gif_size(ffmpeg: &Path, gif: &Path) -> (u64, usize) {
         // Without passthrough, rawvideo output defaults to a constant frame rate
         // and ffmpeg pads the clip by duplicating frames, so the byte count
         // would measure ffmpeg's duplication rather than what the GIF holds.
-        .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .args([
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+        ])
         .arg(&raw)
         .status()
         .expect("running ffmpeg");
     assert!(status.success(), "ffmpeg could not decode the GIF we wrote");
-    let len = std::fs::metadata(&raw).map(|m| m.len() as usize).unwrap_or(0);
+    let len = std::fs::metadata(&raw)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
     let _ = std::fs::remove_file(&raw);
     (0, len)
 }
@@ -296,7 +305,10 @@ fn speed_changes_playback_rate_not_frame_count() {
 
     let doubled = export(
         &tools,
-        &Settings { speed: 2.0, ..base.clone() },
+        &Settings {
+            speed: 2.0,
+            ..base.clone()
+        },
         &Progress::new(),
     )
     .expect("2x export");
@@ -314,14 +326,17 @@ fn speed_changes_playback_rate_not_frame_count() {
         normal.fps
     );
     assert!(
-        (doubled.duration - normal.duration).abs() < 1e-9,
-        "the source range is unchanged, so the clip duration must be too"
+        (doubled.duration * 2.0 - normal.duration).abs() < 1e-9,
+        "2x speed must halve the actual playback duration"
     );
 
     // Halving the speed must land the playback rate below the sampling rate.
     let halved = export(
         &tools,
-        &Settings { speed: 0.5, ..base.clone() },
+        &Settings {
+            speed: 0.5,
+            ..base.clone()
+        },
         &Progress::new(),
     )
     .expect("0.5x export");
@@ -428,7 +443,11 @@ fn a_region_beyond_the_end_is_clamped_to_the_media() {
     let outcome = export(&tools, &settings, &Progress::new()).expect("clamped export");
     // 4 s .. 5 s at 10 fps is ten frames; the export must not run to 90 s.
     assert!(outcome.frames <= 11, "produced {} frames", outcome.frames);
-    assert!(outcome.frames >= 9, "produced only {} frames", outcome.frames);
+    assert!(
+        outcome.frames >= 9,
+        "produced only {} frames",
+        outcome.frames
+    );
     let _ = std::fs::remove_file(&out);
 }
 
@@ -490,7 +509,7 @@ fn cstring(s: &Path) -> std::ffi::CString {
 
 #[test]
 fn preview_publishes_real_pixels_through_the_c_abi() {
-    use gifcore::ffi as ffi;
+    use gifcore::ffi;
 
     let Some(path) = fixture() else {
         eprintln!("skipping: no fixture video available");
@@ -507,11 +526,17 @@ fn preview_publishes_real_pixels_through_the_c_abi() {
     let ffmpeg = std::ffi::CString::new(tools.ffmpeg.to_string_lossy().as_bytes()).unwrap();
     let ffprobe = std::ffi::CString::new(tools.ffprobe.to_string_lossy().as_bytes()).unwrap();
     let input = cstring(&path);
-    unsafe {
-        assert_eq!(ffi::gif_set_ffmpeg_path(handle, ffmpeg.as_ptr()), ffi::GIF_OK);
-        assert_eq!(ffi::gif_set_ffprobe_path(handle, ffprobe.as_ptr()), ffi::GIF_OK);
+    {
         assert_eq!(
-            ffi::gif_load(handle, input.as_ptr()),
+            unsafe { ffi::gif_set_ffmpeg_path(handle, ffmpeg.as_ptr()) },
+            ffi::GIF_OK
+        );
+        assert_eq!(
+            unsafe { ffi::gif_set_ffprobe_path(handle, ffprobe.as_ptr()) },
+            ffi::GIF_OK
+        );
+        assert_eq!(
+            unsafe { ffi::gif_load(handle, input.as_ptr()) },
             ffi::GIF_OK,
             "load failed: {}",
             last_error(handle)
@@ -563,10 +588,14 @@ fn preview_publishes_real_pixels_through_the_c_abi() {
             "thumbnail {i} byte count"
         );
         let buf = unsafe { ffi::gif_thumb_rgb(handle, i as u32) };
-        assert_eq!(buf.len, t.len, "thumbnail {i} buffer disagrees with descriptor");
+        assert_eq!(
+            buf.len, t.len,
+            "thumbnail {i} buffer disagrees with descriptor"
+        );
         let px = unsafe { std::slice::from_raw_parts(buf.data, buf.len) };
         assert!(
-            px.chunks_exact(3).any(|c| c[0] > 150 || c[1] > 150 || c[2] > 150),
+            px.chunks_exact(3)
+                .any(|c| c[0] > 150 || c[1] > 150 || c[2] > 150),
             "thumbnail {i} at t={} is blank",
             t.time
         );
@@ -612,8 +641,7 @@ fn the_thread_count_cannot_change_the_output_bytes() {
     };
 
     let serial = export(&tools, &base, &Progress::new()).expect("single-threaded export");
-    let serial_bytes =
-        std::fs::read(&serial.output).expect("read the single-threaded GIF");
+    let serial_bytes = std::fs::read(&serial.output).expect("read the single-threaded GIF");
 
     for threads in [2u32, 3, 8, 16] {
         let out = scratch().join(format!("threads-{threads}.gif"));
@@ -646,7 +674,10 @@ fn the_thread_count_cannot_change_the_output_bytes() {
     }
 
     // And the automatic choice is the one the UI advertises.
-    assert_eq!(gifcore::export::resolve_threads(0), gifcore::export::default_threads());
+    assert_eq!(
+        gifcore::export::resolve_threads(0),
+        gifcore::export::default_threads()
+    );
 }
 
 /// A threaded export should actually be faster, not just equal. This is a
@@ -654,6 +685,7 @@ fn the_thread_count_cannot_change_the_output_bytes() {
 /// machine; it exists to catch the parallel path being wired up but never
 /// entered.
 #[test]
+#[ignore = "manual performance benchmark; run in release with --ignored"]
 fn threading_speeds_up_a_large_export() {
     let Some(path) = fixture() else {
         eprintln!("skipping: no fixture video available");
@@ -733,36 +765,62 @@ fn repeating_a_poster_request_for_the_same_frame_spawns_nothing() {
     };
     let info = gifcore::probe(&tools, &path).expect("probe");
 
-    let handle = unsafe { ffi::gif_create() };
+    let handle = ffi::gif_create();
     assert!(!handle.is_null(), "gif_create returned null");
     let ffmpeg = std::ffi::CString::new(tools.ffmpeg.to_string_lossy().as_bytes()).unwrap();
     let ffprobe = std::ffi::CString::new(tools.ffprobe.to_string_lossy().as_bytes()).unwrap();
-    unsafe {
-        ffi::gif_set_ffmpeg_path(handle, ffmpeg.as_ptr());
-        ffi::gif_set_ffprobe_path(handle, ffprobe.as_ptr());
+    {
+        unsafe { ffi::gif_set_ffmpeg_path(handle, ffmpeg.as_ptr()) };
+        unsafe { ffi::gif_set_ffprobe_path(handle, ffprobe.as_ptr()) };
     }
     let video = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-    assert_eq!(unsafe { ffi::gif_load(handle, video.as_ptr()) }, 0, "{}", last_error(handle));
+    assert_eq!(
+        unsafe { ffi::gif_load(handle, video.as_ptr()) },
+        0,
+        "{}",
+        last_error(handle)
+    );
 
     // Land on a frame well inside the clip, then request it twice.
     let start = info.frame_time(40);
-    assert_eq!(unsafe { ffi::gif_set_selection(handle, start, start + 0.5) }, 0);
+    assert_eq!(
+        unsafe { ffi::gif_set_selection(handle, start, start + 0.5) },
+        0
+    );
 
     let first = std::time::Instant::now();
-    assert_eq!(unsafe { ffi::gif_update_poster(handle) }, 0, "{}", last_error(handle));
+    assert_eq!(
+        unsafe { ffi::gif_update_poster(handle) },
+        0,
+        "{}",
+        last_error(handle)
+    );
     let cold_ms = first.elapsed().as_millis();
 
     let second = std::time::Instant::now();
-    assert_eq!(unsafe { ffi::gif_update_poster(handle) }, 0, "{}", last_error(handle));
+    assert_eq!(
+        unsafe { ffi::gif_update_poster(handle) },
+        0,
+        "{}",
+        last_error(handle)
+    );
     let warm_ms = second.elapsed().as_millis();
 
     eprintln!("poster decode: first {cold_ms} ms, repeat {warm_ms} ms");
 
     // Nudge the start within the same source frame: still no new decode.
     let nudged = start + 0.4 / info.fps.max(1.0);
-    assert_eq!(unsafe { ffi::gif_set_selection(handle, nudged, nudged + 0.5) }, 0);
+    assert_eq!(
+        unsafe { ffi::gif_set_selection(handle, nudged, nudged + 0.5) },
+        0
+    );
     let third = std::time::Instant::now();
-    assert_eq!(unsafe { ffi::gif_update_poster(handle) }, 0, "{}", last_error(handle));
+    assert_eq!(
+        unsafe { ffi::gif_update_poster(handle) },
+        0,
+        "{}",
+        last_error(handle)
+    );
     let nudged_ms = third.elapsed().as_millis();
 
     unsafe { ffi::gif_destroy(handle) };
@@ -896,7 +954,10 @@ fn a_failed_export_leaves_no_staged_part_file() {
     let result = gifcore::export(&tools, &settings, &Progress::new());
     drop(hold);
 
-    assert!(result.is_err(), "the export should have failed on a locked target");
+    assert!(
+        result.is_err(),
+        "the export should have failed on a locked target"
+    );
     let leftovers: Vec<String> = std::fs::read_dir(&dir)
         .expect("read dir")
         .filter_map(|e| e.ok())

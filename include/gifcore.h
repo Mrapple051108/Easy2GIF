@@ -12,6 +12,12 @@
  * 1/0. On failure gif_last_error() holds a UTF-8, human-readable reason that
  * stays valid until the next call on the same thread.
  *
+ * Concurrency
+ * -----------
+ * One export/estimate per handle; overlapping jobs return GIF_ERR_BUSY.
+ * gif_cancel may run concurrently with a job. Destroy only after all calls finish.
+ * Borrowed buffers require external serialization against load/close/preview rebuild.
+ *
  * Buffer lifetime
  * ---------------
  * gif_poster_rgb() and gif_thumb_rgb() hand out a borrowed view into storage
@@ -29,7 +35,7 @@
 extern "C" {
 #endif
 
-#define GIFCORE_ABI_VERSION 6u
+#define GIFCORE_ABI_VERSION 7u
 
 typedef int32_t gif_status;
 
@@ -40,6 +46,8 @@ typedef int32_t gif_status;
 #define GIF_ERR_TOOL (-4)
 #define GIF_ERR_ENCODE (-5)
 #define GIF_ERR_UNKNOWN (-6)
+#define GIF_ERR_CANCELLED (-8)
+#define GIF_ERR_BUSY (-9)
 /*
  * The GIF could not be written where it was asked to go: the folder cannot be
  * created or is not writable, the target is read-only, or it is held open by
@@ -79,7 +87,7 @@ typedef struct {
     uint32_t width;
     uint32_t height;
     double fps;
-    double duration;
+    double duration; /* actual GIF playback seconds, including speed and delay rounding */
     uint32_t palette_colors;
     uint64_t elapsed_ms;
 } GifCoreExportResult;
@@ -87,6 +95,7 @@ typedef struct {
 /*
  * Every knob of an export. Zero means "use the documented default", so a caller
  * can zero-initialise the struct and set only what it cares about.
+ * Exception in ABI 7: dither_strength=0 explicitly disables dithering; set 100 for default.
  *
  * Added in ABI 5 together with gif_export_ex() and gif_estimate_size(). The
  * older fixed-argument gif_export() is kept and forwards to gif_export_ex().
@@ -105,7 +114,7 @@ typedef struct {
     /* --- 高级设置 --- */
     uint32_t quality;         /* 编码质量 1..=10; 0 => 5, the historical output */
     uint32_t lossy;           /* 有损压缩 0..=100; 0 => off */
-    uint32_t dither_strength; /* 抖动强度 0..=100; 0 => 100 */
+    uint32_t dither_strength; /* ABI 7: 0..=100; 0 disables, set 100 for default */
     int dedupe;               /* 复用重复帧: fold equal frames together */
     int optimize;             /* 帧间透明优化: leave unchanged pixels clear */
     uint32_t tolerance;       /* per-channel slack 0..=64 for `optimize` */
@@ -182,6 +191,7 @@ double gif_selection_duration(GifCore *h);
 uint64_t gif_selection_start_frame(GifCore *h);
 uint64_t gif_selection_end_frame(GifCore *h);
 uint64_t gif_estimate_frames(GifCore *h, double fps);
+uint64_t gif_estimate_frames_ex(GifCore *h, double fps, double speed);
 
 /** Re-decode the poster frame at the current start time. */
 gif_status gif_update_poster(GifCore *h);

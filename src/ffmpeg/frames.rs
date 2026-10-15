@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use super::process::{ffargs, fmt_time, run_ffmpeg_to_temp, MediaTools};
 use super::probe::MediaInfo;
+use super::process::{ffargs, fmt_time, run_ffmpeg_to_temp, MediaTools};
 use crate::error::{Error, Result};
 
 /// An 8-bit RGB image, 3 bytes per pixel.
@@ -12,11 +12,14 @@ pub struct Frame {
     pub w: u32,
     pub h: u32,
     pub rgb: Vec<u8>,
+    /// Display interval relative to the selected stream.
+    pub time: f64,
+    pub end_time: f64,
 }
 
 impl Frame {
     pub fn as_rgb32(&self) -> Vec<u8> {
-        // Tightly packed RGB → 0xffRRGGBB.
+        // Tightly packed RGB -> RGBA bytes, independent of host endianness.
         let mut out = vec![0u8; self.w as usize * self.h as usize * 4];
         for (i, px) in self.rgb.chunks_exact(3).enumerate() {
             let o = i * 4;
@@ -54,19 +57,38 @@ fn fps_filter(count: u32, duration: f64) -> String {
 }
 
 /// Decode the frame displayed at timestamp `time`.
-pub fn decode_frame(
-    tools: &MediaTools,
-    path: &Path,
-    info: &MediaInfo,
-    time: f64,
-) -> Result<Frame> {
-    let t = info.clamp_time(time);
-    // Aim just inside the frame so seeking lands on the intended one.
-    let seek = if info.fps > 0.0 {
-        (t + 0.5 / info.fps).min(info.duration.max(t))
-    } else {
-        t
-    };
+pub fn decode_frame(tools: &MediaTools, path: &Path, info: &MediaInfo, time: f64) -> Result<Frame> {
+    let t = info
+        .clamp_time(time)
+        .min((info.duration - 0.000001).max(0.0));
+    // Read actual PTS, including VFR and the last frame; never add half a frame.
+    let pts_json = tools.frame_times(
+        path,
+        info.video_stream,
+        (t + info.start_time - 1.0).max(0.0),
+        t + info.start_time + 1.0,
+    )?;
+    let parsed = super::json::parse(&pts_json)?;
+    let pts = parsed
+        .get("frames")
+        .and_then(|v| v.as_arr())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.f64_field("best_effort_timestamp_time"))
+        .filter(|v| v.is_finite() && *v <= t + info.start_time + 1e-7)
+        .max_by(f64::total_cmp)
+        .ok_or_else(|| Error::BadMedia("no display frame at the requested time".into()))?;
+    let seek = (pts - info.start_time).max(0.0);
+    let end_time = parsed
+        .get("frames")
+        .and_then(|v| v.as_arr())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.f64_field("best_effort_timestamp_time"))
+        .filter(|v| v.is_finite() && *v > pts + 1e-7)
+        .min_by(f64::total_cmp)
+        .map(|v| v - info.start_time)
+        .unwrap_or((t + 1.0).min(info.duration));
 
     let tmp = run_ffmpeg_to_temp(
         &tools.ffmpeg,
@@ -76,9 +98,16 @@ pub fn decode_frame(
             "-loglevel",
             "error",
             "-ss",
-            format!("{:.6}", seek.min(info.duration.max(0.0))),
+            format!("{:.9}", (pts - info.format_start_time).max(0.0)),
             "-i",
             path.as_os_str(),
+            "-map",
+            format!("0:{}", info.video_stream),
+            "-vf",
+            format!(
+                "scale={}:{}:flags=bilinear,setsar=1",
+                info.width, info.height
+            ),
             "-frames:v",
             "1",
             "-an",
@@ -103,7 +132,7 @@ pub fn decode_frame(
 
     let expect = info.width as usize * info.height as usize * 3;
     let bytes = tmp.read_all()?;
-    if bytes.len() < expect {
+    if bytes.len() != expect {
         return Err(Error::BadMedia(format!(
             "decoded frame is {} bytes, expected {} ({}x{}). The stream may use an \
              unsupported pixel layout.",
@@ -118,6 +147,8 @@ pub fn decode_frame(
         w: info.width,
         h: info.height,
         rgb: bytes[..expect].to_vec(),
+        time: seek,
+        end_time,
     })
 }
 
@@ -129,13 +160,13 @@ pub fn filmstrip(
     count: u32,
     thumb_w: u32,
 ) -> Result<Filmstrip> {
-    let count = count.max(1);
+    let count = count.clamp(1, 256);
     let thumb_w = thumb_w.clamp(32, 480);
 
+    let h = ((thumb_w as f64 / info.aspect() / 2.0).round() as u32 * 2).clamp(2, 4096);
     let filter = format!(
-        "{},scale={}:-2:flags=bilinear,showinfo",
-        fps_filter(count, info.duration),
-        thumb_w
+        "{},scale={thumb_w}:{h}:flags=bilinear,setsar=1,showinfo",
+        fps_filter(count, info.duration)
     );
 
     let tmp = run_ffmpeg_to_temp(
@@ -148,6 +179,10 @@ pub fn filmstrip(
             "-nostats",
             "-i",
             path.as_os_str(),
+            "-map",
+            format!("0:{}", info.video_stream),
+            "-frames:v",
+            count.to_string(),
             "-an",
             "-sn",
             "-vf",
@@ -172,44 +207,13 @@ pub fn filmstrip(
     let bytes = tmp.read_all()?;
     let times = parse_showinfo_times(&tmp.stderr);
 
-    // Work out the per-thumbnail frame size. Height follows from the aspect
-    // ratio; -2 keeps it even.
-    let mut h = ((thumb_w as f64) / info.aspect()).round() as u32;
-    if h % 2 != 0 {
-        h += 1;
-    }
-    h = h.max(2);
     let frame_bytes = thumb_w as usize * h as usize * 3;
-
-    if bytes.is_empty() || frame_bytes == 0 {
+    if bytes.is_empty() || bytes.len() % frame_bytes != 0 {
         return Err(Error::BadMedia(
-            "no thumbnails could be decoded from this video".into(),
+            "thumbnail output is empty or not frame-aligned".into(),
         ));
     }
-
-    let mut n = bytes.len() / frame_bytes;
-    // Tolerate a rounding difference in the scaled height.
-    if n == 0 {
-        // Try to solve for the height that makes the buffer divide evenly.
-        for cand in (2..=thumb_w).rev() {
-            let hc = if cand % 2 != 0 { cand + 1 } else { cand };
-            let fb = thumb_w as usize * hc as usize * 3;
-            if fb > 0 && bytes.len() % fb == 0 {
-                h = hc;
-                n = bytes.len() / fb;
-                break;
-            }
-        }
-        if n == 0 {
-            return Err(Error::BadMedia(format!(
-                "thumbnail buffer of {} bytes does not divide into {}x? RGB frames",
-                bytes.len(),
-                thumb_w
-            )));
-        }
-    }
-
-    let frame_bytes = thumb_w as usize * h as usize * 3;
+    let n = bytes.len() / frame_bytes;
     let mut thumbs = Vec::with_capacity(n);
     for i in 0..n {
         let start = i * frame_bytes;
@@ -217,6 +221,8 @@ pub fn filmstrip(
             w: thumb_w,
             h,
             rgb: bytes[start..start + frame_bytes].to_vec(),
+            time: times.get(i).copied().unwrap_or(0.0),
+            end_time: info.duration,
         });
     }
 
@@ -229,7 +235,7 @@ pub fn filmstrip(
                 if thumbs.len() <= 1 {
                     0.0
                 } else {
-                    info.duration * i as f64 / (thumbs.len() - 1) as f64
+                    info.duration * i as f64 / thumbs.len() as f64
                 }
             })
             .collect()

@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::error::{Error, Result};
-use crate::ffmpeg::process::{fmt_time, run_ffmpeg_stream, MediaTools};
-use crate::ffmpeg::probe::{probe, MediaInfo};
+use crate::ffmpeg::probe::{probe_with_cancel, MediaInfo};
+use crate::ffmpeg::process::{fmt_time, run_ffmpeg_stream_cancel, MediaTools};
 use crate::gif::encode::{frame_block, set_block_delay, Disposal, FrameSpec, GifWriter};
 use crate::gif::quantize::{
-    map_frame_dithered_with, map_frame_with, posterize_in_place, posterize_levels,
-    quantize_iterations, quantize_with_options, ColorMap, Palette,
+    map_frame_dithered_with, map_frame_ordered_with, map_frame_with, posterize_in_place,
+    posterize_levels, quantize_cancellable, quantize_iterations, ColorMap, Palette,
 };
 use crate::gif::Dither;
 
@@ -32,6 +32,7 @@ pub struct Progress {
     phase: AtomicU32,
     done: AtomicU32,
     total: AtomicU32,
+    completed: AtomicU32,
 }
 
 impl Default for Progress {
@@ -46,6 +47,7 @@ impl Progress {
             phase: AtomicU32::new(PHASE_IDLE),
             done: AtomicU32::new(0),
             total: AtomicU32::new(0),
+            completed: AtomicU32::new(0),
         }
     }
 
@@ -78,13 +80,33 @@ impl Progress {
         match self.phase_code() {
             PHASE_DONE => 1.0,
             PHASE_IDLE | PHASE_FAILED => 0.0,
-            _ if total == 0 => 0.0,
-            _ => (self.done() as f64 / total as f64).clamp(0.0, 1.0),
+            phase => {
+                let within = if total == 0 {
+                    0.0
+                } else {
+                    (self.done() as f64 / total as f64).clamp(0.0, 1.0)
+                };
+                let (base, weight) = match phase {
+                    PHASE_DECODING => (0.0, 0.4),
+                    PHASE_ANALYSING => (0.4, 0.2),
+                    PHASE_ENCODING => (0.6, 0.4),
+                    _ => (0.0, 0.0),
+                };
+                let current = ((base + weight * within) * 1_000_000.0).round() as u32;
+                (self
+                    .completed
+                    .fetch_max(current, Ordering::Relaxed)
+                    .max(current) as f64)
+                    / 1_000_000.0
+            }
         }
     }
 
     /// Begin a phase with `total` work items.
     pub fn begin(&self, code: u32, total: u32) {
+        if code == PHASE_IDLE || code == PHASE_DECODING {
+            self.completed.store(0, Ordering::Relaxed);
+        }
         self.total.store(total.max(1), Ordering::Relaxed);
         self.done.store(0, Ordering::Relaxed);
         self.phase.store(code, Ordering::Relaxed);
@@ -104,6 +126,9 @@ impl Progress {
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub input: PathBuf,
+    /// Selected stream, filled from the probe before decoding.
+    pub video_stream: u32,
+    pub seek_offset: f64,
     pub output: PathBuf,
     /// Start of the selection, in seconds from the beginning of the video.
     pub start: f64,
@@ -123,7 +148,7 @@ pub struct Settings {
     /// Worker threads for the palette-mapping pass. `0` means "decide for me",
     /// which resolves to half of the machine's logical CPUs at run time.
     pub max_threads: u32,
-    // ---- advanced settings (all of them default to the old behaviour) ----
+    // ---- advanced settings ----
     /// 「编码质量」 1..=10: how much k-means effort goes into the palette.
     pub quality: u32,
     /// 「有损压缩」 0..=100: snap colours onto a coarse grid before quantising.
@@ -142,14 +167,15 @@ pub struct Settings {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// Quality used when the caller has no opinion; it reproduces the historical
-/// three k-means iterations, so untouched exports stay byte-identical.
+/// Default effort: three Lloyd iterations. Correctness fixes may change encoded bytes.
 pub const DEFAULT_QUALITY: u32 = 5;
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             input: PathBuf::new(),
+            video_stream: 0,
+            seek_offset: 0.0,
             output: PathBuf::new(),
             start: 0.0,
             end: 0.0,
@@ -182,7 +208,7 @@ impl Settings {
 }
 
 fn cancelled_error() -> Error {
-    Error::Invalid("export cancelled".into())
+    Error::Cancelled
 }
 
 /// The per-frame knobs, resolved once per export instead of once per frame.
@@ -204,17 +230,9 @@ struct FrameOptions {
 
 impl FrameOptions {
     fn new(settings: &Settings, transparent: Option<u8>) -> FrameOptions {
-        // Ordered dithering has always run at a lower amplitude than
-        // Floyd–Steinberg; keep that as the 100% reference point so a full
-        // slider reproduces the previous output exactly.
-        let base = if settings.dither == Dither::Ordered {
-            0.6
-        } else {
-            1.0
-        };
         FrameOptions {
             dither: settings.dither,
-            strength: base * (settings.dither_strength.min(100) as f64 / 100.0),
+            strength: settings.dither_strength.min(100) as f64 / 100.0,
             posterize_levels: posterize_levels(settings.lossy),
             transparent,
             tolerance: settings.tolerance.min(64),
@@ -223,27 +241,30 @@ impl FrameOptions {
     }
 }
 
-/// Overwrite the indices of every pixel that has barely changed since `prev`
-/// with the transparent index, so the decoder reuses the previous frame there.
+/// Compare mapped colours to the actual retained canvas, never the source RGB.
 fn apply_transparency(
     indices: &mut [u8],
-    px: &[u8],
-    prev: &[u8],
+    canvas: &mut Vec<u8>,
+    palette: &Palette,
     tolerance: u32,
     transparent: u8,
-) {
-    // Three channels, so the per-channel slack is one third of the budget.
-    let slack = tolerance.saturating_mul(3);
-    let usable = (px.len().min(prev.len()) / 3).min(indices.len());
-    for i in 0..usable {
-        let o = i * 3;
-        let delta = (px[o] as i32 - prev[o] as i32).unsigned_abs()
-            + (px[o + 1] as i32 - prev[o + 1] as i32).unsigned_abs()
-            + (px[o + 2] as i32 - prev[o + 2] as i32).unsigned_abs();
-        if delta <= slack {
-            indices[i] = transparent;
+) -> bool {
+    if canvas.len() != indices.len() {
+        *canvas = indices.to_vec();
+        return false;
+    }
+    let mut unchanged = true;
+    for (current, retained) in indices.iter_mut().zip(canvas.iter_mut()) {
+        let a = palette.colors[*current as usize];
+        let b = palette.colors[*retained as usize];
+        if (0..3).all(|c| a[c].abs_diff(b[c]) as u32 <= tolerance) {
+            *current = transparent;
+        } else {
+            *retained = *current;
+            unchanged = false;
         }
     }
+    unchanged
 }
 
 /// How many logical CPUs this machine reports, read at run time.
@@ -328,28 +349,64 @@ pub fn human_bytes(b: u64) -> String {
 ///
 /// Both dimensions are kept even, which is what the scale filter wants.
 pub fn output_size(info: &MediaInfo, max_width: u32) -> (u32, u32) {
-    let max_width = max_width.clamp(16, 4096);
-    let aspect = info.aspect();
-    let mut w = info.width.min(max_width);
-    let mut h = (w as f64 / aspect).round() as u32;
-    // Guard against degenerate results on extreme aspect ratios.
-    if h < 2 {
-        h = 2;
-        w = ((h as f64) * aspect).round() as u32;
+    // GIF supports odd dimensions. Even rounding is optional, never a reason to upscale.
+    let cap = max_width.clamp(2, 4096);
+    let aspect = info.aspect().max(1e-12);
+    let mut w = info.width.min(cap).max(1);
+    let mut h = (w as f64 / aspect).round().max(1.0);
+    if h > 4096.0 {
+        h = 4096.0;
+        w = (h * aspect).round().clamp(1.0, cap as f64) as u32;
     }
-    if w % 2 != 0 {
-        w += 1;
+    let even = |n: u32| if n > 1 { n - n % 2 } else { 1 };
+    (even(w), even(h as u32))
+}
+
+fn validate_settings(settings: &Settings) -> Result<()> {
+    check_cancel(settings)?;
+    if !settings.fps.is_finite() || !(0.1..=120.0).contains(&settings.fps) {
+        return Err(Error::Invalid(
+            "frame rate must be finite and between 0.1 and 120".into(),
+        ));
     }
-    if h % 2 != 0 {
-        h += 1;
+    if !settings.speed.is_finite() || !(0.1..=10.0).contains(&settings.speed) {
+        return Err(Error::Invalid(
+            "speed must be finite and between 0.1 and 10".into(),
+        ));
     }
-    (w.max(2), h.max(2))
+    if !settings.start.is_finite() || !settings.end.is_finite() || settings.end <= settings.start {
+        return Err(Error::Invalid(
+            "the selection must contain finite increasing times".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn check_cancel(settings: &Settings) -> Result<()> {
+    if settings.cancelled() {
+        Err(Error::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn timeline_cs(settings: &Settings, frames: u64) -> u64 {
+    let planned = planned_frames(settings.start, settings.end, settings.fps);
+    ((settings.end - settings.start) / settings.speed * 100.0 * frames as f64 / planned as f64)
+        .round()
+        .max(2.0 * frames as f64) as u64
+}
+
+fn delay_at(total_cs: u64, frames: u64, index: u64) -> u16 {
+    let boundary =
+        |i: u64| ((i as u128 * total_cs as u128 + frames as u128 / 2) / frames as u128) as u64;
+    (boundary(index + 1) - boundary(index)).clamp(2, u16::MAX as u64) as u16
 }
 
 /// How many frames the request will produce.
 pub fn planned_frames(start: f64, end: f64, fps: f64) -> u64 {
     let dur = (end - start).max(0.0);
-    if fps <= 0.0 || dur <= 0.0 {
+    if !fps.is_finite() || !start.is_finite() || !end.is_finite() || fps <= 0.0 || dur <= 0.0 {
         return 1;
     }
     ((dur * fps).round() as u64).max(1)
@@ -366,7 +423,7 @@ fn decode_args_at(
     frames: u64,
 ) -> Vec<std::ffi::OsString> {
     let vf = format!(
-        "fps={},trim=end_frame={},scale={}:{}:flags=lanczos",
+        "fps={},trim=end_frame={},scale={}:{}:flags=lanczos,setsar=1",
         fmt_time(settings.fps),
         frames,
         w,
@@ -378,9 +435,11 @@ fn decode_args_at(
         "-loglevel".into(),
         "error".into(),
         "-ss".into(),
-        fmt_time(start).into(),
+        fmt_time(start + settings.seek_offset).into(),
         "-i".into(),
         settings.input.as_os_str().to_os_string(),
+        "-map".into(),
+        format!("0:{}", settings.video_stream).into(),
         "-an".into(),
         "-sn".into(),
         "-dn".into(),
@@ -398,6 +457,7 @@ fn decode_args_at(
 struct RawFrames {
     temp: crate::ffmpeg::process::TempFile,
     count: u64,
+    segments: Vec<u64>,
 }
 
 fn decode_all(
@@ -431,9 +491,12 @@ fn decode_segments(
     let out = std::fs::File::create(temp.path())?;
     let mut out = BufWriter::with_capacity(1 << 20, out);
     let mut written: u64 = 0;
+    let mut segments = Vec::new();
 
     for (start, frames) in runs {
-        let io_result = decode_run_into(
+        check_cancel(settings)?;
+        let before = written;
+        decode_run_into(
             tools,
             settings,
             *start,
@@ -444,14 +507,8 @@ fn decode_segments(
             &mut out,
             &mut written,
             progress,
-        );
-        if let Err(e) = io_result {
-            // A cancelled or partially broken decode may still have produced
-            // usable frames, so only fail hard when we got nothing at all.
-            if written == 0 {
-                return Err(e);
-            }
-        }
+        )?;
+        segments.push(written - before);
     }
 
     {
@@ -472,6 +529,7 @@ fn decode_segments(
     Ok(RawFrames {
         temp,
         count: written,
+        segments,
     })
 }
 
@@ -491,21 +549,33 @@ fn decode_run_into<W: std::io::Write>(
 ) -> Result<()> {
     let mut pending: Vec<u8> = Vec::with_capacity(cap * 2);
     let args = decode_args_at(settings, start, w, h, frames);
-    run_ffmpeg_stream(&tools.ffmpeg, &args, cap, |chunk| {
-        pending.extend_from_slice(chunk);
-        // Write out only whole frames so the file stays frame-aligned.
-        while pending.len() >= cap {
-            out.write_all(&pending[..cap])?;
-            pending.drain(..cap);
-            *written += 1;
-            progress.step();
-            if *written % 4 == 0 && settings.cancelled() {
-                return Err(cancelled_error());
+    run_ffmpeg_stream_cancel(
+        &tools.ffmpeg,
+        &args,
+        cap,
+        settings.cancel.as_deref(),
+        |chunk| {
+            pending.extend_from_slice(chunk);
+            // Write out only whole frames so the file stays frame-aligned.
+            while pending.len() >= cap {
+                out.write_all(&pending[..cap])?;
+                pending.drain(..cap);
+                *written += 1;
+                progress.step();
+                if settings.cancelled() {
+                    return Err(cancelled_error());
+                }
             }
+            Ok(())
+        },
+    )
+    .and_then(|_| {
+        if pending.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::BadMedia("truncated decoder frame".into()))
         }
-        Ok(())
     })
-    .map(|_| ())
 }
 
 /// A sequential reader over a frame-aligned raw file.
@@ -550,30 +620,24 @@ impl RawReader {
     }
 }
 
-/// Run an export. Never panics; all failures come back as [`Error`].
-pub fn export(
-    tools: &MediaTools,
-    settings: &Settings,
-    progress: &Progress,
-) -> Result<Outcome> {
+/// Run an export; expected input, tool, cancellation and I/O failures return [`Error`].
+pub fn export(tools: &MediaTools, settings: &Settings, progress: &Progress) -> Result<Outcome> {
     let started = std::time::Instant::now();
 
     if settings.output.as_os_str().is_empty() {
         return Err(Error::Invalid("no output file was chosen".into()));
     }
-    if settings.fps <= 0.0 || settings.fps > 120.0 {
-        return Err(Error::Invalid(format!(
-            "frame rate {} is outside the supported range 0.1 - 120",
-            settings.fps
-        )));
-    }
-    if settings.end <= settings.start {
+    validate_settings(settings)?;
+    check_output(&settings.output)?;
+    if same_file(&settings.input, &settings.output)? {
         return Err(Error::Invalid(
-            "the end of the selection must come after the start".into(),
+            "input and output must be different files".into(),
         ));
     }
-
-    let info = probe(tools, &settings.input)?;
+    if settings.output.exists() && !settings.overwrite {
+        return Err(Error::Output("the output already exists".into()));
+    }
+    let info = probe_with_cancel(tools, &settings.input, settings.cancel.as_deref())?;
     let start = info.clamp_time(settings.start);
     let end = info.clamp_time(settings.end);
     if end <= start {
@@ -582,15 +646,9 @@ pub fn export(
         ));
     }
 
-    // Sample at the requested rate regardless of the speed multiplier, and let
-    // the speed ride entirely on the per-frame delay. Folding speed into the
-    // sampling rate instead would keep the playback duration unchanged while
-    // dropping frames, i.e. a choppier clip rather than a faster one.
-    let speed = settings.speed.clamp(0.1, 10.0);
-    let effective_fps = settings.fps.clamp(0.1, 120.0);
-    // A GIF delay is stored in centiseconds with a floor of 2, so 50 fps is the
-    // fastest rate the container can actually express.
-    let play_fps = (effective_fps * speed).clamp(0.1, 50.0);
+    // Resample when necessary to respect the compatible 2 cs minimum without slow motion.
+    let rate_limited = settings.fps * settings.speed > 50.0;
+    let effective_fps = settings.fps.min(50.0 / settings.speed);
     let frames = planned_frames(start, end, effective_fps);
     let (w, h) = output_size(&info, settings.max_width);
 
@@ -598,6 +656,8 @@ pub fn export(
     settings.start = start;
     settings.end = end;
     settings.fps = effective_fps;
+    settings.video_stream = info.video_stream;
+    settings.seek_offset = info.start_time - info.format_start_time;
 
     // Pass 1: decode the selection into a frame-aligned raw file.
     // The worker count is settled up front: both the palette search and the
@@ -620,7 +680,7 @@ pub fn export(
     let optimize = settings.optimize;
     let requested = settings.colors.clamp(2, 256);
     let map_colors = if optimize {
-        (requested - 1).max(2) as usize
+        (requested - 1).max(1) as usize
     } else {
         requested as usize
     };
@@ -633,7 +693,7 @@ pub fn export(
         h,
         map_colors,
         threads,
-        settings.quality,
+        &settings,
         progress,
     )?;
     if palette.colors.is_empty() {
@@ -643,17 +703,16 @@ pub fn export(
 
     // Pass 3: index frames in parallel and stream them into the GIF.
     progress.begin(PHASE_ENCODING, frame_count.min(u32::MAX as u64) as u32);
-    let delay_cs = ((100.0 / play_fps).round() as u32).clamp(2, 1000) as u16;
     // One colour map for the whole export. It costs 64^3 nearest-colour
     // searches, so rebuilding it per frame used to dwarf the mapping work
     // itself. It is read-only once built, so every worker shares it.
-    let colour_map = ColorMap::build_with_threads(&palette, threads);
+    let colour_map = ColorMap::build_cancellable(&palette, threads, settings.cancel.as_deref())?;
     let gif_palette = if optimize {
         palette.with_reserved_slot()
     } else {
         palette.clone()
     };
-    let frames_written = encode_frames(
+    let stats = encode_frames(
         &settings,
         raw.temp.path(),
         &palette,
@@ -661,12 +720,11 @@ pub fn export(
         &colour_map,
         w,
         h,
-        delay_cs,
         frame_count,
         threads,
         progress,
     )?;
-    if frames_written == 0 {
+    if stats.written == 0 {
         return Err(Error::BadMedia("no frames were decoded".into()));
     }
     progress.finish(PHASE_DONE);
@@ -675,7 +733,11 @@ pub fn export(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let mut warning = None;
+    let mut warning = if rate_limited {
+        Some("sampling rate was reduced to preserve playback speed at the 2 cs delay limit".into())
+    } else {
+        None
+    };
     if frame_count < frames {
         warning = Some(format!(
             "the video only supplied {frame_count} of the {frames} frames requested"
@@ -683,19 +745,21 @@ pub fn export(
     }
     if bytes > 40 * 1024 * 1024 {
         warning = Some(match warning {
-            Some(w) => format!("{w}; the GIF is very large, try fewer colours or a lower frame rate"),
+            Some(w) => {
+                format!("{w}; the GIF is very large, try fewer colours or a lower frame rate")
+            }
             None => "the GIF is very large, try fewer colours or a lower frame rate".to_string(),
         });
     }
 
     Ok(Outcome {
         output: settings.output.clone(),
-        frames: frames_written,
+        frames: stats.written,
         bytes,
         width: w,
         height: h,
-        fps: play_fps,
-        duration: end - start,
+        fps: stats.written as f64 / (stats.total_cs as f64 / 100.0),
+        duration: stats.total_cs as f64 / 100.0,
         palette_colors: palette.colors.len() as u32,
         elapsed_ms: started.elapsed().as_millis() as u64,
         warning,
@@ -707,7 +771,7 @@ pub fn export(
 pub struct Estimate {
     /// Projected size of the finished GIF, in bytes.
     pub bytes: u64,
-    /// Frames the finished GIF would contain.
+    /// Sampled output frames before optional deduplication.
     pub frames: u64,
     /// Frames that were really measured.
     pub sampled: u64,
@@ -823,19 +887,8 @@ fn header_bytes(palette: &Palette, w: u32, h: u32, loop_forever: bool) -> Result
 /// whenever dithering, the inter-frame diff, or the lossy pre-pass is on, which
 /// is precisely when the number is worth having.
 pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) -> Result<Estimate> {
-    if settings.fps <= 0.0 || settings.fps > 120.0 {
-        return Err(Error::Invalid(format!(
-            "frame rate {} is outside the supported range 0.1 - 120",
-            settings.fps
-        )));
-    }
-    if settings.end <= settings.start {
-        return Err(Error::Invalid(
-            "the end of the selection must come after the start".into(),
-        ));
-    }
-
-    let info = probe(tools, &settings.input)?;
+    validate_settings(settings)?;
+    let info = probe_with_cancel(tools, &settings.input, settings.cancel.as_deref())?;
     let start = info.clamp_time(settings.start);
     let end = info.clamp_time(settings.end);
     if end <= start {
@@ -844,9 +897,7 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
         ));
     }
 
-    let speed = settings.speed.clamp(0.1, 10.0);
-    let effective_fps = settings.fps.clamp(0.1, 120.0);
-    let play_fps = (effective_fps * speed).clamp(0.1, 50.0);
+    let effective_fps = settings.fps.min(50.0 / settings.speed);
     let frames = planned_frames(start, end, effective_fps);
     let (w, h) = output_size(&info, settings.max_width);
 
@@ -854,6 +905,8 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
     settings.start = start;
     settings.end = end;
     settings.fps = effective_fps;
+    settings.video_stream = info.video_stream;
+    settings.seek_offset = info.start_time - info.format_start_time;
 
     let plan = estimate_segments(start, end, effective_fps, frames);
     let planned_sample: u64 = plan.iter().map(|(_, n)| *n).sum();
@@ -871,7 +924,7 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
     let optimize = settings.optimize;
     let requested = settings.colors.clamp(2, 256);
     let map_colors = if optimize {
-        (requested - 1).max(2) as usize
+        (requested - 1).max(1) as usize
     } else {
         requested as usize
     };
@@ -882,7 +935,7 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
         h,
         map_colors,
         threads,
-        settings.quality,
+        &settings,
         progress,
     )?;
     if palette.colors.is_empty() {
@@ -891,14 +944,13 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
     progress.finish(PHASE_ANALYSING);
 
     progress.begin(PHASE_ENCODING, measured_frames.min(u32::MAX as u64) as u32);
-    let delay_cs = ((100.0 / play_fps).round() as u32).clamp(2, 1000) as u16;
-    let colour_map = ColorMap::build_with_threads(&palette, threads);
+    let colour_map = ColorMap::build_cancellable(&palette, threads, settings.cancel.as_deref())?;
     let gif_palette = if optimize {
         palette.with_reserved_slot()
     } else {
         palette.clone()
     };
-    let (sink, _) = stream_frames(
+    let (sink, stats) = stream_frames(
         CountingSink::default(),
         &settings,
         raw.temp.path(),
@@ -907,10 +959,10 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
         &colour_map,
         w,
         h,
-        delay_cs,
         measured_frames,
         threads,
         frame_bytes,
+        &raw.segments,
         progress,
     )?;
     progress.finish(PHASE_DONE);
@@ -920,10 +972,26 @@ pub fn estimate(tools: &MediaTools, settings: &Settings, progress: &Progress) ->
     let bytes = if exact {
         measured
     } else {
-        // Only the per-frame bytes scale; the header is a fixed cost.
         let header = header_bytes(&gif_palette, w, h, settings.loop_forever)?;
-        let body = measured.saturating_sub(header);
-        header + (body * frames).div_ceil(measured_frames.max(1))
+        let key = stats.key_bytes.div_ceil(stats.segments.max(1));
+        if settings.dedupe && stats.uniform {
+            // An all-static sample needs delay-split frames, not N copies of its header/body.
+            header
+                + key
+                    * timeline_cs(&settings, frames)
+                        .div_ceil(u16::MAX as u64)
+                        .max(1)
+        } else if settings.dedupe && stats.changes == 0 {
+            // Segments repeat internally but show different images: do not call the whole clip static.
+            header + key * frames.div_ceil(ESTIMATE_SEGMENT_FRAMES)
+        } else {
+            let transitions = stats.transitions.max(1);
+            let delta = stats.delta_bytes as u128 * frames.saturating_sub(1) as u128;
+            header
+                + key
+                + (delta.div_ceil(transitions as u128))
+                    .min(u64::MAX as u128 - header as u128 - key as u128) as u64
+        }
     };
 
     Ok(Estimate {
@@ -949,7 +1017,10 @@ pub fn check_output(path: &Path) -> Result<()> {
     if let Some(parent) = parent {
         if !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                Error::Output(format!("cannot create the folder {}: {e}", parent.display()))
+                Error::Output(format!(
+                    "cannot create the folder {}: {e}",
+                    parent.display()
+                ))
             })?;
         } else if !parent.is_dir() {
             // A path component that exists but is a file can never be a folder.
@@ -966,18 +1037,9 @@ pub fn check_output(path: &Path) -> Result<()> {
     // permission the export itself needs, so a folder that only *looks* fine
     // still gets caught here.
     let dir = parent.unwrap_or_else(|| Path::new("."));
-    let probe = dir.join(format!(".gifcore-write-{}.tmp", std::process::id()));
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-        }
-        Err(e) => {
-            return Err(Error::Output(format!(
-                "the folder {} is not writable: {e}",
-                dir.display()
-            )));
-        }
-    }
+    let probe = crate::ffmpeg::process::TempFile::in_dir(dir, "write")
+        .map_err(|e| Error::Output(format!("the folder {} is not writable: {e}", dir.display())))?;
+    drop(probe);
 
     if path.exists() {
         if let Ok(meta) = std::fs::metadata(path) {
@@ -999,6 +1061,54 @@ pub fn check_output(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn same_file(input: &Path, output: &Path) -> Result<bool> {
+    if !output.exists() {
+        return Ok(false);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct Info {
+            attributes: u32,
+            creation: [u32; 2],
+            access: [u32; 2],
+            write: [u32; 2],
+            volume: u32,
+            size_high: u32,
+            size_low: u32,
+            links: u32,
+            index_high: u32,
+            index_low: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandle(h: *mut std::ffi::c_void, out: *mut Info) -> i32;
+        }
+        let id = |p: &Path| -> Result<(u32, u32, u32)> {
+            let file = std::fs::File::open(p)?;
+            let mut info = std::mem::MaybeUninit::<Info>::uninit();
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let info = unsafe { info.assume_init() };
+            Ok((info.volume, info.index_high, info.index_low))
+        };
+        Ok(id(input)? == id(output)?)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::metadata(input)?;
+        let b = std::fs::metadata(output)?;
+        Ok(a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        Ok(std::fs::canonicalize(input)? == std::fs::canonicalize(output)?)
+    }
+}
+
 /// Palette-map every decoded frame and stream the result into the GIF, through
 /// a sibling temp file so a failure cannot leave a half-written `.gif` behind.
 ///
@@ -1014,16 +1124,18 @@ fn encode_frames(
     colour_map: &ColorMap,
     w: u32,
     h: u32,
-    delay_cs: u16,
     frame_count: u64,
     threads: u32,
     progress: &Progress,
-) -> Result<u64> {
+) -> Result<EncodingStats> {
     let out_path = &settings.output;
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             std::fs::create_dir_all(parent).map_err(|e| {
-                Error::Output(format!("cannot create the folder {}: {e}", parent.display()))
+                Error::Output(format!(
+                    "cannot create the folder {}: {e}",
+                    parent.display()
+                ))
             })?;
         }
     }
@@ -1035,13 +1147,20 @@ fn encode_frames(
     }
 
     let frame_bytes = w as usize * h as usize * 3;
-    let part = out_path.with_extension("gif.part");
+    let part_guard = crate::ffmpeg::process::TempFile::in_dir(
+        out_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+        "stage",
+    )
+    .map_err(|e| Error::Output(format!("cannot create export staging file: {e}")))?;
+    let part = part_guard.path();
 
     let frames_written;
     {
-        let file = std::fs::File::create(&part).map_err(|e| {
-            Error::Output(format!("cannot create {}: {e}", part.display()))
-        })?;
+        let file = std::fs::File::create(&part)
+            .map_err(|e| Error::Output(format!("cannot create {}: {e}", part.display())))?;
         let sink = BufWriter::with_capacity(1 << 20, file);
         match stream_frames(
             sink,
@@ -1052,10 +1171,10 @@ fn encode_frames(
             colour_map,
             w,
             h,
-            delay_cs,
             frame_count,
             threads,
             frame_bytes,
+            &[frame_count],
             progress,
         ) {
             Ok((mut sink, written)) => {
@@ -1080,7 +1199,9 @@ fn encode_frames(
     // worse — when the delete failed it returned early and orphaned the staged
     // `.gif.part`, and it destroyed the previous GIF before the new one was
     // known to be in place.
-    std::fs::rename(&part, out_path).map_err(|e| {
+    check_cancel(settings)?;
+    let commit = commit_output(part, out_path, settings.overwrite);
+    commit.map_err(|e| {
         let _ = std::fs::remove_file(&part);
         Error::Output(format!(
             "cannot move the GIF to {}: {e} (it may be open in another program)",
@@ -1090,27 +1211,65 @@ fn encode_frames(
     Ok(frames_written)
 }
 
-/// Hand the block being held back to the writer, patching in the delay it has
-/// accumulated while identical frames were folded into it.
+/// Commit with an atomic no-replace operation when overwrite is disabled.
+fn commit_output(part: &Path, output: &Path, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        return std::fs::rename(part, output);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn MoveFileExW(source: *const u16, target: *const u16, flags: u32) -> i32;
+        }
+        let wide = |p: &Path| {
+            p.as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (wide(part), wide(output));
+        if unsafe { MoveFileExW(a.as_ptr(), b.as_ptr(), 0) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::hard_link(part, output)
+    }
+}
+
+#[derive(Default)]
+struct EncodingStats {
+    written: u64,
+    total_cs: u64,
+    key_bytes: u64,
+    delta_bytes: u64,
+    segments: u64,
+    transitions: u64,
+    changes: u64,
+    uniform: bool,
+}
+
 fn flush_pending<W: std::io::Write>(
     writer: &mut GifWriter<W>,
     pending: &mut Option<Vec<u8>>,
     pending_delay: &mut u32,
     written: &mut u64,
-    progress: &Progress,
 ) -> Result<()> {
     if let Some(mut block) = pending.take() {
-        let delay = (*pending_delay).clamp(1, u16::MAX as u32) as u16;
-        set_block_delay(&mut block, delay);
+        set_block_delay(&mut block, *pending_delay as u16);
         writer.add_block(&block)?;
         *written += 1;
         *pending_delay = 0;
-        progress.step();
     }
     Ok(())
 }
 
-/// Read, palette-map and write frames in bounded batches.
+/// Index in parallel, update the retained canvas in order, then compress in parallel.
 #[allow(clippy::too_many_arguments)]
 fn stream_frames<W: std::io::Write>(
     sink: W,
@@ -1121,19 +1280,16 @@ fn stream_frames<W: std::io::Write>(
     colour_map: &ColorMap,
     w: u32,
     h: u32,
-    delay_cs: u16,
     frame_count: u64,
     threads: u32,
     frame_bytes: usize,
+    segments: &[u64],
     progress: &Progress,
-) -> Result<(W, u64)> {
+) -> Result<(W, EncodingStats)> {
+    check_cancel(settings)?;
     let opts = FrameOptions::new(
         settings,
-        if settings.optimize {
-            Some(gif_palette.reserved_index())
-        } else {
-            None
-        },
+        settings.optimize.then(|| gif_palette.reserved_index()),
     );
     let mut writer = GifWriter::new(
         sink,
@@ -1143,267 +1299,203 @@ fn stream_frames<W: std::io::Write>(
         settings.loop_forever,
     )?;
     let mut reader = RawReader::open(raw_path, frame_bytes)?;
-
-    // Cap a batch by bytes rather than by frame count: a 4K clip and a 320x240
-    // clip must not reserve the same amount of memory. Each in-flight frame
-    // costs one RGB buffer plus one index buffer.
-    const BATCH_BUDGET: usize = 24 << 20;
-    let per_frame = (frame_bytes * 2).max(1);
-    let by_budget = (BATCH_BUDGET / per_frame).max(1);
-    let batch = ((threads as usize) * 2).clamp(1, by_budget);
-
-    let mut pixels: Vec<Vec<u8>> = Vec::with_capacity(batch);
-    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(batch);
-    let mut read_total = 0u64;
-    let mut written = 0u64;
-
-    // 「复用重复帧」 holds one block back so that a run of identical blocks can
-    // become a single, longer-lasting frame. With the setting off the block is
-    // handed straight on again, so nothing about the output changes.
-    let mut pending: Option<Vec<u8>> = None;
-    let mut pending_delay: u32 = 0;
-    // 「帧间透明优化」 needs the previous frame's pixels, which may live in the
-    // previous batch.
-    let mut carry: Option<Vec<u8>> = None;
-
-    while read_total < frame_count {
-        let want = ((frame_count - read_total) as usize).min(batch);
-        pixels.clear();
-        for _ in 0..want {
-            let mut buf = Vec::with_capacity(frame_bytes);
-            if !reader.next(&mut buf)? {
-                break;
-            }
-            pixels.push(buf);
-        }
-        if pixels.is_empty() {
-            break;
-        }
-        read_total += pixels.len() as u64;
-
-        // Cancellation is checked once per batch. A batch is small, so this
-        // stays responsive without touching an atomic for every frame.
-        if settings.cancelled() {
-            return Err(cancelled_error());
-        }
-
-        // Map and compress the whole batch in parallel, then write the blocks
-        // in order. Only this final write loop has to be serial.
-        blocks.clear();
-        blocks.resize_with(pixels.len(), Vec::new);
-        encode_batch(
-            palette,
-            gif_palette,
-            colour_map,
-            &pixels,
-            &mut blocks,
-            w as usize,
-            h as usize,
-            delay_cs,
-            &opts,
-            carry.as_deref(),
-            threads,
-        )?;
-
-        if opts.transparent.is_some() {
-            let last = pixels.len() - 1;
-            carry = Some(pixels[last].clone());
-        }
-
-        for block in &blocks {
-            if opts.dedupe {
-                if let Some(held) = pending.as_mut() {
-                    if held == block && pending_delay + delay_cs as u32 <= u16::MAX as u32 {
-                        // The rendered frame is identical, so show the previous
-                        // one for longer instead of paying for the bytes twice.
-                        pending_delay += delay_cs as u32;
-                        continue;
-                    }
-                }
-            }
+    let batch = (threads as usize * 2).clamp(1, ((24 << 20) / (frame_bytes * 3).max(1)).max(1));
+    let mut stats = EncodingStats {
+        uniform: true,
+        ..Default::default()
+    };
+    let mut reference: Option<Vec<u8>> = None;
+    let mut pending = None;
+    let mut pending_delay = 0u32;
+    let mut canvas = Vec::new();
+    let mut previous = Vec::new();
+    let mut read = 0u64;
+    let mut segment = 0usize;
+    let mut segment_end = segments.first().copied().unwrap_or(frame_count);
+    let total_cs = timeline_cs(settings, frame_count);
+    while read < frame_count {
+        check_cancel(settings)?;
+        if read == segment_end {
             flush_pending(
                 &mut writer,
                 &mut pending,
                 &mut pending_delay,
-                &mut written,
-                progress,
+                &mut stats.written,
             )?;
-            pending = Some(block.clone());
-            pending_delay = delay_cs as u32;
+            canvas.clear();
+            previous.clear();
+            segment += 1;
+            segment_end += segments.get(segment).copied().unwrap_or(frame_count - read);
+        }
+        let count = ((segment_end - read).min(frame_count - read) as usize).min(batch);
+        if count == 0 {
+            return Err(Error::BadMedia("empty decoded segment".into()));
+        }
+        let mut pixels = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut px = Vec::new();
+            if !reader.next(&mut px)? {
+                return Err(Error::BadMedia("raw frame count changed".into()));
+            }
+            pixels.push(px);
+        }
+        let mut mapped = vec![Vec::new(); count];
+        parallel_each(&pixels, &mut mapped, threads, |px, out| {
+            check_cancel(settings)?;
+            *out = map_pixels(colour_map, palette, px, w as usize, h as usize, &opts);
+            Ok(())
+        })?;
+        drop(pixels);
+        let mut keys = Vec::with_capacity(count);
+        let mut equal = Vec::with_capacity(count);
+        for indices in &mut mapped {
+            check_cancel(settings)?;
+            let key = previous.is_empty();
+            if let Some(reference) = &reference {
+                stats.uniform &= reference == indices;
+            } else {
+                reference = Some(indices.clone());
+            }
+            let same = if let Some(index) = opts.transparent {
+                apply_transparency(indices, &mut canvas, palette, opts.tolerance, index)
+            } else {
+                !key && *indices == previous
+            };
+            if opts.transparent.is_none() {
+                previous.clone_from(indices);
+            } else if key {
+                previous.push(0);
+            } // only the first-frame marker is needed
+            keys.push(key);
+            equal.push(same);
+        }
+        let mut blocks = vec![Vec::new(); count];
+        parallel_each(&mapped, &mut blocks, threads, |indices, out| {
+            check_cancel(settings)?;
+            *out = frame_block(&FrameSpec {
+                width: w as u16,
+                height: h as u16,
+                indices,
+                palette: gif_palette,
+                local_table: false,
+                delay_cs: 0,
+                disposal: Disposal::DoNotDispose,
+                transparent: opts.transparent,
+            })?;
+            Ok(())
+        })?;
+        for (i, block) in blocks.into_iter().enumerate() {
+            check_cancel(settings)?;
+            let delay = delay_at(total_cs, frame_count, read) as u32;
+            stats.total_cs += delay as u64;
+            if keys[i] {
+                stats.key_bytes += block.len() as u64;
+                stats.segments += 1;
+            } else {
+                stats.transitions += 1;
+                if !equal[i] {
+                    stats.changes += 1;
+                }
+                if !opts.dedupe || !equal[i] {
+                    stats.delta_bytes += block.len() as u64;
+                }
+            }
+            if opts.dedupe
+                && equal[i]
+                && pending.is_some()
+                && pending_delay + delay <= u16::MAX as u32
+            {
+                pending_delay += delay;
+            } else {
+                flush_pending(
+                    &mut writer,
+                    &mut pending,
+                    &mut pending_delay,
+                    &mut stats.written,
+                )?;
+                pending = Some(block);
+                pending_delay = delay;
+            }
+            read += 1;
+            progress.step();
         }
     }
-
+    check_cancel(settings)?;
     flush_pending(
         &mut writer,
         &mut pending,
         &mut pending_delay,
-        &mut written,
-        progress,
+        &mut stats.written,
     )?;
-    let sink = writer.finish()?;
-    Ok((sink, written))
+    Ok((writer.finish()?, stats))
 }
 
-/// Palette-map and LZW-compress a batch of frames across up to `threads`
-/// workers, producing one ready-to-write block per frame.
-///
-/// Frames are independent — dithering diffuses error only within its own frame,
-/// and each frame carries its own LZW stream — so this is a straight
-/// data-parallel split over contiguous chunks. Doing the compression here
-/// rather than on the writing thread matters: it is the second-largest
-/// per-frame cost after the mapping itself. The chunks are disjoint, which is
-/// what lets every worker hold a `&mut` into the same output slice at once.
-#[allow(clippy::too_many_arguments)]
-fn encode_batch(
-    palette: &Palette,
-    gif_palette: &Palette,
-    colour_map: &ColorMap,
-    pixels: &[Vec<u8>],
-    blocks: &mut [Vec<u8>],
-    w: usize,
-    h: usize,
-    delay_cs: u16,
-    opts: &FrameOptions,
-    carry: Option<&[u8]>,
-    threads: u32,
-) -> Result<()> {
-    let n = pixels.len();
-    let workers = (threads as usize).max(1).min(n.max(1));
-
-    /// The frame a delta is taken against: the batch's previous frame, or the
-    /// last frame of the previous batch for the first one.
-    fn previous<'a>(
-        i: usize,
-        pixels: &'a [Vec<u8>],
-        carry: Option<&'a [u8]>,
-    ) -> Option<&'a [u8]> {
-        if i == 0 {
-            carry
-        } else {
-            Some(pixels[i - 1].as_slice())
-        }
-    }
-
-    if workers <= 1 {
-        for (i, (px, block)) in pixels.iter().zip(blocks.iter_mut()).enumerate() {
-            *block = map_and_compress(
-                colour_map,
-                palette,
-                gif_palette,
-                px,
-                previous(i, pixels, carry),
-                w,
-                h,
-                delay_cs,
-                opts,
-            )?;
+fn parallel_each<F>(input: &[Vec<u8>], output: &mut [Vec<u8>], threads: u32, f: F) -> Result<()>
+where
+    F: Fn(&[u8], &mut Vec<u8>) -> Result<()> + Sync,
+{
+    let workers = (threads as usize).max(1).min(input.len().max(1));
+    if workers == 1 {
+        for (src, dst) in input.iter().zip(output) {
+            f(src, dst)?;
         }
         return Ok(());
     }
-
-    let chunk = n.div_ceil(workers);
-    let failure: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
-
-    // Scoped threads let the workers borrow the batch directly, so no frame is
-    // copied to hand it over and nothing has to outlive the call.
+    let chunk = input.len().div_ceil(workers).max(1);
     std::thread::scope(|scope| {
-        for (ci, (blk_chunk, px_chunk)) in blocks
-            .chunks_mut(chunk)
-            .zip(pixels.chunks(chunk))
-            .enumerate()
-        {
-            let failure = &failure;
-            let base = ci * chunk;
-            scope.spawn(move || {
-                for (j, (block, px)) in blk_chunk.iter_mut().zip(px_chunk.iter()).enumerate() {
-                    let i = base + j;
-                    match map_and_compress(
-                        colour_map,
-                        palette,
-                        gif_palette,
-                        px,
-                        previous(i, pixels, carry),
-                        w,
-                        h,
-                        delay_cs,
-                        opts,
-                    ) {
-                        Ok(bytes) => *block = bytes,
-                        Err(e) => {
-                            // Keep the first error and stop this worker; the
-                            // others finish their own chunks harmlessly.
-                            if let Ok(mut slot) = failure.lock() {
-                                if slot.is_none() {
-                                    *slot = Some(e);
-                                }
-                            }
-                            return;
-                        }
-                    }
+        let mut handles = Vec::new();
+        for (src, dst) in input.chunks(chunk).zip(output.chunks_mut(chunk)) {
+            let f = &f;
+            handles.push(scope.spawn(move || -> Result<()> {
+                for (src, dst) in src.iter().zip(dst) {
+                    f(src, dst)?;
                 }
-            });
+                Ok(())
+            }));
         }
-    });
-
-    match failure.into_inner() {
-        Ok(Some(e)) => Err(e),
-        _ => Ok(()),
-    }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| Error::Encode("encoding worker panicked".into()))??;
+        }
+        Ok(())
+    })
 }
 
-/// Map one frame's pixels and compress it into a write-ready GIF block.
-#[allow(clippy::too_many_arguments)]
-fn map_and_compress(
+fn map_pixels(
     colour_map: &ColorMap,
     palette: &Palette,
-    gif_palette: &Palette,
     px: &[u8],
-    prev: Option<&[u8]>,
     w: usize,
     h: usize,
-    delay_cs: u16,
     opts: &FrameOptions,
-) -> Result<Vec<u8>> {
-    // 「有损压缩」 runs before anything else looks at the pixels, so the palette,
-    // the indices and the inter-frame diff all agree on the same colours.
-    let posterized;
-    let source: &[u8] = if opts.posterize_levels >= 2 {
+) -> Vec<u8> {
+    let processed;
+    let source = if opts.posterize_levels >= 2 {
         let mut copy = px.to_vec();
         posterize_in_place(&mut copy, opts.posterize_levels);
-        posterized = copy;
-        &posterized
+        processed = copy;
+        processed.as_slice()
     } else {
         px
     };
-
-    let mut indices: Vec<u8> = Vec::with_capacity(w * h);
+    let mut indices = Vec::with_capacity(w * h);
     match opts.dither {
         Dither::None => map_frame_with(colour_map, source, &mut indices),
-        Dither::Ordered | Dither::Floyd => {
-            map_frame_dithered_with(colour_map, palette, source, w, h, opts.strength, &mut indices)
+        Dither::Ordered => {
+            map_frame_ordered_with(colour_map, source, w, opts.strength, &mut indices)
         }
+        Dither::Floyd => map_frame_dithered_with(
+            colour_map,
+            palette,
+            &source,
+            w,
+            h,
+            opts.strength,
+            &mut indices,
+        ),
     }
-
-    if let (Some(index), Some(prev)) = (opts.transparent, prev) {
-        // Compare the raw pixels on both sides: "the source frame did not
-        // change here" is a statement about the video, not about the palette.
-        apply_transparency(&mut indices, px, prev, opts.tolerance, index);
-    }
-
-    frame_block(&FrameSpec {
-        width: w as u16,
-        height: h as u16,
-        indices: &indices,
-        palette: gif_palette,
-        local_table: false,
-        delay_cs,
-        disposal: if opts.transparent.is_some() {
-            Disposal::DoNotDispose
-        } else {
-            Disposal::Keep
-        },
-        transparent: opts.transparent,
-    })
+    indices
 }
 
 /// Sample frames spread over the selection and quantise the union of them.
@@ -1415,61 +1507,61 @@ fn build_palette(
     h: u32,
     max_colors: usize,
     threads: u32,
-    quality: u32,
+    settings: &Settings,
     progress: &Progress,
 ) -> Result<Palette> {
     const MAX_SAMPLES: usize = 40;
     const SAMPLE_PIXEL_BUDGET: usize = 1_500_000;
 
-    let pixels_per_frame = (w as usize) * (h as usize);
-
-    // How many frames to sample, and how densely to subsample each of them.
-    let target_frames = (frame_count as usize).min(MAX_SAMPLES).max(1);
-    let stride = (frame_count as usize / target_frames).max(1);
-    let pixel_stride = (pixels_per_frame * target_frames / SAMPLE_PIXEL_BUDGET).max(1);
-
-    let mut sample: Vec<u8> = Vec::with_capacity(SAMPLE_PIXEL_BUDGET * 3);
-    let mut buf: Vec<u8> = Vec::new();
-    let mut seen = 0usize;
-    let mut taken = 0usize;
-
-    while reader.next(&mut buf)? {
-        if seen % stride == 0 {
-            if pixel_stride <= 1 {
-                sample.extend_from_slice(&buf);
-            } else {
-                let npx = buf.len() / 3;
-                let mut p = 0usize;
-                while p < npx {
-                    let o = p * 3;
-                    sample.push(buf[o]);
-                    sample.push(buf[o + 1]);
-                    sample.push(buf[o + 2]);
-                    p += pixel_stride;
-                }
-            }
-            taken += 1;
-            // Report coarse progress: this phase is short next to decoding.
-            if taken % 8 == 0 {
-                progress.step();
-            }
-            if taken >= target_frames {
-                break;
-            }
+    use std::io::{Seek, SeekFrom};
+    let pixels_per_frame = w as usize * h as usize;
+    let target_frames = frame_count.min(MAX_SAMPLES as u64).max(1) as usize;
+    progress.begin(PHASE_ANALYSING, (target_frames + 1) as u32);
+    let pixel_stride = (pixels_per_frame * target_frames)
+        .div_ceil(SAMPLE_PIXEL_BUDGET)
+        .max(1);
+    let mut sample = Vec::with_capacity(SAMPLE_PIXEL_BUDGET * 3);
+    let mut buf = Vec::new();
+    for index in sample_indices(frame_count, target_frames) {
+        check_cancel(settings)?;
+        let offset = index
+            .checked_mul(reader.cap as u64)
+            .ok_or_else(|| Error::Invalid("raw offset overflow".into()))?;
+        reader.file.seek(SeekFrom::Start(offset))?;
+        if !reader.next(&mut buf)? {
+            return Err(Error::BadMedia("missing palette sample".into()));
         }
-        seen += 1;
+        posterize_in_place(&mut buf, posterize_levels(settings.lossy));
+        for px in buf.chunks_exact(3).step_by(pixel_stride) {
+            sample.extend_from_slice(px);
+        }
+        progress.step();
     }
-
     if sample.len() < 3 {
-        return Err(Error::BadMedia("no pixel data available to build a palette".into()));
+        return Err(Error::BadMedia("no palette samples".into()));
     }
-
-    Ok(quantize_with_options(
+    let palette = quantize_cancellable(
         &sample,
         max_colors,
         threads,
-        quantize_iterations(quality),
-    ))
+        quantize_iterations(settings.quality),
+        settings.cancel.as_deref(),
+    )?;
+    progress.step();
+    Ok(palette)
+}
+
+fn sample_indices(frames: u64, count: usize) -> Vec<u64> {
+    (0..count)
+        .map(|i| {
+            if count <= 1 {
+                0
+            } else {
+                ((i as u128 * (frames - 1) as u128 + (count - 1) as u128 / 2) / (count - 1) as u128)
+                    as u64
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1502,7 +1594,7 @@ mod tests {
             let (w, h) = output_size(&media(sw, sh), 480);
             assert_eq!(w % 2, 0, "{sw}x{sh} -> {w}x{h}");
             assert_eq!(h % 2, 0, "{sw}x{sh} -> {w}x{h}");
-            assert!(w >= 2 && h >= 2);
+            assert!(w >= 1 && h >= 1);
         }
     }
 
@@ -1525,7 +1617,7 @@ mod tests {
         assert_eq!(p.fraction(), 0.0);
         p.begin(PHASE_ENCODING, 4);
         p.step();
-        assert!((p.fraction() - 0.25).abs() < 1e-9);
+        assert!((p.fraction() - 0.7).abs() < 1e-9);
         p.finish(PHASE_DONE);
         assert_eq!(p.fraction(), 1.0);
         assert_eq!(p.phase_name(), "Done");
@@ -1558,10 +1650,16 @@ mod tests {
         assert_eq!(runs.len(), 8);
         assert!(runs.iter().all(|(_, n)| *n == ESTIMATE_SEGMENT_FRAMES));
 
-        let indices: Vec<u64> = runs.iter().map(|(t, _)| (t * 12.0).round() as u64).collect();
+        let indices: Vec<u64> = runs
+            .iter()
+            .map(|(t, _)| (t * 12.0).round() as u64)
+            .collect();
         // First run flush with the start, last run ending on the last frame.
         assert_eq!(indices, vec![0, 8, 17, 25, 33, 41, 50, 58]);
-        assert_eq!(indices.last().copied().unwrap() + ESTIMATE_SEGMENT_FRAMES, 60);
+        assert_eq!(
+            indices.last().copied().unwrap() + ESTIMATE_SEGMENT_FRAMES,
+            60
+        );
     }
 
     #[test]
@@ -1578,7 +1676,10 @@ mod tests {
             let total: u64 = runs.iter().map(|(_, n)| *n).sum();
             assert_eq!(total, ESTIMATE_SAMPLE_FRAMES, "frames={frames}");
 
-            let indices: Vec<u64> = runs.iter().map(|(t, _)| (t * 12.0).round() as u64).collect();
+            let indices: Vec<u64> = runs
+                .iter()
+                .map(|(t, _)| (t * 12.0).round() as u64)
+                .collect();
             for (i, pair) in indices.windows(2).enumerate() {
                 assert!(
                     pair[1] >= pair[0] + ESTIMATE_SEGMENT_FRAMES,
@@ -1628,15 +1729,17 @@ mod tests {
                 dedupe: false,
             };
             let mut serial: Vec<Vec<u8>> = vec![Vec::new(); frames.len()];
-            encode_batch(
-                &palette, &palette, &cm, &frames, &mut serial, w, h, 8, &opts, None, 1,
-            )?;
+            parallel_each(&frames, &mut serial, 1, |px, out| {
+                *out = map_pixels(&cm, &palette, px, w, h, &opts);
+                Ok(())
+            })?;
 
             for threads in [2u32, 3, 4, 8, 16] {
                 let mut got: Vec<Vec<u8>> = vec![Vec::new(); frames.len()];
-                encode_batch(
-                    &palette, &palette, &cm, &frames, &mut got, w, h, 8, &opts, None, threads,
-                )?;
+                parallel_each(&frames, &mut got, threads, |px, out| {
+                    *out = map_pixels(&cm, &palette, px, w, h, &opts);
+                    Ok(())
+                })?;
                 assert_eq!(
                     got, serial,
                     "{dither:?} with {threads} threads diverged from the serial result"
@@ -1683,5 +1786,135 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn palette_sampling_covers_the_tail_and_respects_preprocessing() -> Result<()> {
+        let temp = crate::ffmpeg::process::TempFile::new("palette-regression")?;
+        // Only the last of 79 frames is red. Old stride=1 stopped at frame 39.
+        let mut raw = vec![0u8; 79 * 2 * 2 * 3];
+        for px in raw[78 * 12..].chunks_exact_mut(3) {
+            px.copy_from_slice(&[255, 0, 0]);
+        }
+        std::fs::write(temp.path(), &raw)?;
+        let mut reader = RawReader::open(temp.path(), 12)?;
+        let p = build_palette(
+            &mut reader,
+            79,
+            2,
+            2,
+            8,
+            1,
+            &Settings::default(),
+            &Progress::new(),
+        )?;
+        assert!(p.colors.contains(&[255, 0, 0]));
+        assert_eq!(sample_indices(79, 40).last(), Some(&78));
+        let mut reader = RawReader::open(temp.path(), 12)?;
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(matches!(
+            build_palette(
+                &mut reader,
+                79,
+                2,
+                2,
+                8,
+                1,
+                &Settings {
+                    cancel: Some(cancel),
+                    ..Settings::default()
+                },
+                &Progress::new()
+            ),
+            Err(Error::Cancelled)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dimensions_stay_bounded_without_upscaling_extreme_aspects() {
+        for (w, h) in [
+            (100000, 2),
+            (2, 100000),
+            (1, 1),
+            (u32::MAX, 1),
+            (1, u32::MAX),
+        ] {
+            for cap in [2, 17, 480, 4096] {
+                let (ow, oh) = output_size(&media(w, h), cap);
+                assert!((1..=cap).contains(&ow));
+                assert!((1..=4096).contains(&oh));
+            }
+        }
+    }
+
+    #[test]
+    fn delay_rounding_distributes_error_instead_of_accumulating() {
+        for n in [1, 3, 30, 50, 1000] {
+            let total = 100u64.max(2 * n);
+            assert_eq!(
+                (0..n).map(|i| delay_at(total, n, i) as u64).sum::<u64>(),
+                total
+            );
+        }
+    }
+
+    #[test]
+    fn progress_does_not_drop_between_phases_or_after_dedupe() {
+        let p = Progress::new();
+        let mut previous = 0.0;
+        for phase in [PHASE_DECODING, PHASE_ANALYSING, PHASE_ENCODING] {
+            p.begin(phase, 10);
+            for _ in 0..10 {
+                p.step();
+                let now = p.fraction();
+                assert!(now >= previous);
+                previous = now;
+            }
+        }
+    }
+
+    #[test]
+    fn final_no_replace_commit_refuses_a_target_created_after_preflight() -> Result<()> {
+        let stage = crate::ffmpeg::process::TempFile::new("stage-race")?;
+        let target = crate::ffmpeg::process::TempFile::new("target-race")?;
+        std::fs::write(stage.path(), b"new")?;
+        std::fs::write(target.path(), b"created by another writer")?;
+        assert!(commit_output(stage.path(), target.path(), false).is_err());
+        assert_eq!(std::fs::read(target.path())?, b"created by another writer");
+        Ok(())
+    }
+
+    #[test]
+    fn dedupe_splits_long_delays_without_losing_playback_time() -> Result<()> {
+        let temp = crate::ffmpeg::process::TempFile::new("delay-split")?;
+        std::fs::write(temp.path(), vec![0u8; 700 * 12])?;
+        let palette = Palette {
+            colors: vec![[0, 0, 0]],
+        };
+        let map = ColorMap::build(&palette);
+        let settings = Settings {
+            end: 7000.0,
+            fps: 0.1,
+            dedupe: true,
+            ..Settings::default()
+        };
+        let (_, stats) = stream_frames(
+            CountingSink::default(),
+            &settings,
+            temp.path(),
+            &palette,
+            &palette,
+            &map,
+            2,
+            2,
+            700,
+            1,
+            12,
+            &[700],
+            &Progress::new(),
+        )?;
+        assert_eq!(stats.total_cs, 700000);
+        assert_eq!(stats.written, 11);
+        Ok(())
     }
 }

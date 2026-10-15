@@ -27,7 +27,7 @@ use crate::gif::Dither;
 
 /// ABI revision. Bump whenever a published struct changes layout or an
 /// exported function's signature changes.
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 /// Status codes shared with the header.
 pub const GIF_OK: c_int = 0;
@@ -40,6 +40,8 @@ pub const GIF_ERR_UNKNOWN: c_int = -6;
 /// The GIF could not be written to the requested location: no permission, the
 /// folder cannot be created, or the target file is in use by another program.
 pub const GIF_ERR_OUTPUT: c_int = -7;
+pub const GIF_ERR_CANCELLED: c_int = -8;
+pub const GIF_ERR_BUSY: c_int = -9;
 
 // ---------------------------------------------------------------------------
 // Published structures
@@ -110,6 +112,8 @@ fn clear_error() {
 
 fn code_of(e: &Error) -> c_int {
     match e {
+        Error::Cancelled => GIF_ERR_CANCELLED,
+        Error::Busy => GIF_ERR_BUSY,
         Error::Invalid(_) => GIF_ERR_INVALID,
         Error::Io(_) => GIF_ERR_IO,
         Error::Output(_) => GIF_ERR_OUTPUT,
@@ -121,14 +125,18 @@ fn code_of(e: &Error) -> c_int {
 
 /// Run `f`, reporting failures through the thread-local error slot.
 fn guard<F: FnOnce() -> Result<c_int, Error>>(f: F) -> c_int {
-    match f() {
-        Ok(code) => {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(code)) => {
             clear_error();
             code
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             set_error(&e.to_string());
             code_of(&e)
+        }
+        Err(_) => {
+            set_error("internal kernel panic");
+            GIF_ERR_UNKNOWN
         }
     }
 }
@@ -140,9 +148,6 @@ fn guard<F: FnOnce() -> Result<c_int, Error>>(f: F) -> c_int {
 struct Preview {
     /// Poster frame at the current start time.
     poster: Option<frames::Frame>,
-    /// Which source frame `poster` holds, so a second request for the same
-    /// frame can be answered without spawning ffmpeg again.
-    poster_frame: Option<i64>,
     /// Timeline thumbnails.
     strip: Vec<frames::Frame>,
     /// Source time of each thumbnail.
@@ -156,7 +161,6 @@ impl Default for Preview {
     fn default() -> Self {
         Preview {
             poster: None,
-            poster_frame: None,
             strip: Vec::new(),
             strip_times: Vec::new(),
             thumbs: Vec::new(),
@@ -166,6 +170,7 @@ impl Default for Preview {
 }
 
 struct State {
+    generation: u64,
     tools: MediaTools,
     info: Option<MediaInfo>,
     /// Selection in seconds.
@@ -261,6 +266,7 @@ pub extern "C" fn gif_resolve_threads(requested: u32) -> u32 {
 pub extern "C" fn gif_create() -> *mut GifCore {
     let core = Box::new(GifCore {
         state: Mutex::new(State {
+            generation: 0,
             tools: MediaTools::discover(),
             info: None,
             start: 0.0,
@@ -280,7 +286,10 @@ pub extern "C" fn gif_create() -> *mut GifCore {
 
 /// Destroy a handle. Safe to call with null.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_destroy(h: *mut GifCore) {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_destroy(h: *mut GifCore) {
     if h.is_null() {
         return;
     }
@@ -291,19 +300,15 @@ pub extern "C" fn gif_destroy(h: *mut GifCore) {
 
 /// Message from the most recent failing call on this thread.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_last_error(h: *mut GifCore) -> *const c_char {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_last_error(h: *mut GifCore) -> *const c_char {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return std::ptr::null();
     };
-    let mut st = match core.state.lock() {
-        Ok(s) => s,
-        Err(p) => p.into_inner(),
-    };
-    LAST_ERROR.with(|e| {
-        let msg = e.borrow().clone();
-        st.cached_error = msg;
-    });
-    st.cached_error.as_ptr()
+    let _ = core;
+    LAST_ERROR.with(|e| e.borrow().as_ptr())
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +317,10 @@ pub extern "C" fn gif_last_error(h: *mut GifCore) -> *const c_char {
 
 /// Override the ffmpeg location (used by tests and advanced setups).
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_set_ffmpeg_path(h: *mut GifCore, path: *const c_char) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_set_ffmpeg_path(h: *mut GifCore, path: *const c_char) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         let p = to_str(path)?;
@@ -326,7 +334,10 @@ pub extern "C" fn gif_set_ffmpeg_path(h: *mut GifCore, path: *const c_char) -> c
 
 /// Override the ffprobe location.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_set_ffprobe_path(h: *mut GifCore, path: *const c_char) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_set_ffprobe_path(h: *mut GifCore, path: *const c_char) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         let p = to_str(path)?;
@@ -340,7 +351,10 @@ pub extern "C" fn gif_set_ffprobe_path(h: *mut GifCore, path: *const c_char) -> 
 
 /// Probe the tools and return [`GIF_OK`] when both are runnable.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_check_tools(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_check_tools(h: *mut GifCore) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         let st = core.state.lock().map_err(lock_err)?;
@@ -352,23 +366,7 @@ pub extern "C" fn gif_check_tools(h: *mut GifCore) -> c_int {
 
 /// Run `<tool> -version` to prove the binary exists and executes.
 fn check_binary(tool: &std::ffi::OsString) -> Result<(), Error> {
-    let out = crate::ffmpeg::process::quiet_command(tool)
-        .arg("-version")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    match out {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(Error::ToolFailed {
-            cmd: format!("{} -version", tool.to_string_lossy()),
-            detail: format!("exit status {s}"),
-        }),
-        Err(e) => Err(match e.kind() {
-            std::io::ErrorKind::NotFound => Error::ToolMissing(tool.to_string_lossy().into_owned()),
-            _ => Error::Io(e.to_string()),
-        }),
-    }
+    crate::ffmpeg::process::run_ffmpeg_quiet(tool, &["-version".into()])
 }
 
 fn lock_err<T>(_: T) -> Error {
@@ -384,7 +382,10 @@ fn lock_err<T>(_: T) -> Error {
 /// Returns [`GIF_OK`] on success; on failure the previous media stays loaded and
 /// [`gif_last_error`] explains why.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_load(h: *mut GifCore, path: *const c_char) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_load(h: *mut GifCore, path: *const c_char) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         let p = to_str(path)?;
@@ -398,6 +399,7 @@ pub extern "C" fn gif_load(h: *mut GifCore, path: *const c_char) -> c_int {
         };
         let info = probe::probe(&st_tools, &path)?;
         let mut st = core.state.lock().map_err(lock_err)?;
+        st.generation = st.generation.wrapping_add(1);
         st.start = 0.0;
         st.end = info.duration;
         st.preview = Preview::default();
@@ -409,10 +411,14 @@ pub extern "C" fn gif_load(h: *mut GifCore, path: *const c_char) -> c_int {
 
 /// Forget the loaded media.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_close(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_close(h: *mut GifCore) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         let mut st = core.state.lock().map_err(lock_err)?;
+        st.generation = st.generation.wrapping_add(1);
         st.info = None;
         st.start = 0.0;
         st.end = 0.0;
@@ -424,7 +430,10 @@ pub extern "C" fn gif_close(h: *mut GifCore) -> c_int {
 
 /// Whether media is loaded.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_has_media(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_has_media(h: *mut GifCore) -> c_int {
     match unsafe { as_handle(h) } {
         Ok(core) => match core.state.lock() {
             Ok(st) => st.info.is_some() as c_int,
@@ -437,7 +446,9 @@ pub extern "C" fn gif_has_media(h: *mut GifCore) -> c_int {
 macro_rules! info_getter {
     ($name:ident, $ty:ty, $field:ident, $default:expr) => {
         #[unsafe(no_mangle)]
-        pub extern "C" fn $name(h: *mut GifCore) -> $ty {
+        /// # Safety
+        /// The handle must be null or a live handle for the duration of this call.
+        pub unsafe extern "C" fn $name(h: *mut GifCore) -> $ty {
             let Ok(core) = (unsafe { as_handle(h) }) else {
                 return $default;
             };
@@ -463,7 +474,10 @@ info_getter!(gif_has_audio, c_int, has_audio, 0);
 
 /// Total frames derived from duration and rate when the container is silent.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_total_frames(h: *mut GifCore) -> u64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_total_frames(h: *mut GifCore) -> u64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0;
     };
@@ -476,7 +490,10 @@ pub extern "C" fn gif_total_frames(h: *mut GifCore) -> u64 {
 
 /// Video codec name. Empty when nothing is loaded.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_video_codec(h: *mut GifCore) -> *const c_char {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_video_codec(h: *mut GifCore) -> *const c_char {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return std::ptr::null();
     };
@@ -499,7 +516,10 @@ pub extern "C" fn gif_video_codec(h: *mut GifCore) -> *const c_char {
 
 /// Set the selection, in seconds. Values are clamped and ordered.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_set_selection(h: *mut GifCore, start: f64, end: f64) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_set_selection(h: *mut GifCore, start: f64, end: f64) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         let mut st = core.state.lock().map_err(lock_err)?;
@@ -524,7 +544,10 @@ pub extern "C" fn gif_set_selection(h: *mut GifCore, start: f64, end: f64) -> c_
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_selection_start(h: *mut GifCore) -> f64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_selection_start(h: *mut GifCore) -> f64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0.0;
     };
@@ -536,7 +559,10 @@ pub extern "C" fn gif_selection_start(h: *mut GifCore) -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_selection_end(h: *mut GifCore) -> f64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_selection_end(h: *mut GifCore) -> f64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0.0;
     };
@@ -549,7 +575,10 @@ pub extern "C" fn gif_selection_end(h: *mut GifCore) -> f64 {
 
 /// Selection length in seconds.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_selection_duration(h: *mut GifCore) -> f64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_selection_duration(h: *mut GifCore) -> f64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0.0;
     };
@@ -562,7 +591,10 @@ pub extern "C" fn gif_selection_duration(h: *mut GifCore) -> f64 {
 
 /// Frame index of the current selection start.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_selection_start_frame(h: *mut GifCore) -> u64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_selection_start_frame(h: *mut GifCore) -> u64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0;
     };
@@ -578,7 +610,10 @@ pub extern "C" fn gif_selection_start_frame(h: *mut GifCore) -> u64 {
 
 /// Frame index of the current selection end.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_selection_end_frame(h: *mut GifCore) -> u64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_selection_end_frame(h: *mut GifCore) -> u64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0;
     };
@@ -594,7 +629,10 @@ pub extern "C" fn gif_selection_end_frame(h: *mut GifCore) -> u64 {
 
 /// How many frames an export with `fps` would write. Never zero once loaded.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_estimate_frames(h: *mut GifCore, fps: f64) -> u64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_estimate_frames(h: *mut GifCore, fps: f64) -> u64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0;
     };
@@ -608,25 +646,50 @@ pub extern "C" fn gif_estimate_frames(h: *mut GifCore, fps: f64) -> u64 {
     export::planned_frames(st.start, st.end, fps)
 }
 
+/// Frames sampled after the 2 cs playback limit, before deduplication.
+/// # Safety
+/// The handle must be null or live for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gif_estimate_frames_ex(h: *mut GifCore, fps: f64, speed: f64) -> u64 {
+    if !fps.is_finite() || !speed.is_finite() || fps <= 0.0 || speed <= 0.0 {
+        return 0;
+    }
+    unsafe { gif_estimate_frames(h, fps.min(50.0 / speed)) }
+}
+
 // ---------------------------------------------------------------------------
 // Preview
 // ---------------------------------------------------------------------------
 
 /// Decode the frame shown at the selection start and publish it as the poster.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_update_poster(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_update_poster(h: *mut GifCore) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
-        let (tools, info, start, wanted, unchanged) = {
+        let (tools, info, start, wanted, unchanged, generation) = {
             let st = core.state.lock().map_err(lock_err)?;
             let info = st
                 .info
                 .clone()
                 .ok_or_else(|| Error::Invalid("no video is loaded".into()))?;
             let start = st.start;
-            let wanted = info.time_to_frame(start);
-            let unchanged = st.preview.poster.is_some() && st.preview.poster_frame == Some(wanted);
-            (st.tools.clone(), info, start, wanted, unchanged)
+            let wanted = start.to_bits() as i64;
+            let unchanged = st
+                .preview
+                .poster
+                .as_ref()
+                .is_some_and(|f| start >= f.time && start < f.end_time);
+            (
+                st.tools.clone(),
+                info,
+                start,
+                wanted,
+                unchanged,
+                st.generation,
+            )
         };
         // Dragging a handle asks for this over and over with times that land on
         // the same frame. Every decode is a whole ffmpeg process, so when the
@@ -634,17 +697,23 @@ pub extern "C" fn gif_update_poster(h: *mut GifCore) -> c_int {
         if unchanged {
             return Ok(GIF_OK);
         }
-        let frame = frames::decode_frame(&tools, PathBuf::from(&info.path).as_path(), &info, start)?;
+        let frame =
+            frames::decode_frame(&tools, PathBuf::from(&info.path).as_path(), &info, start)?;
         let mut st = core.state.lock().map_err(lock_err)?;
+        if st.generation != generation || st.start.to_bits() as i64 != wanted {
+            return Err(Error::Invalid("preview request was superseded".into()));
+        }
         st.preview.poster = Some(frame);
-        st.preview.poster_frame = Some(wanted);
         Ok(GIF_OK)
     })
 }
 
 /// Poster frame pixels. Returns an empty buffer when there is no poster.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_poster_rgb(h: *mut GifCore) -> GifCoreBuffer {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_poster_rgb(h: *mut GifCore) -> GifCoreBuffer {
     let empty = GifCoreBuffer {
         data: std::ptr::null(),
         len: 0,
@@ -666,12 +735,18 @@ pub extern "C" fn gif_poster_rgb(h: *mut GifCore) -> GifCoreBuffer {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_poster_width(h: *mut GifCore) -> u32 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_poster_width(h: *mut GifCore) -> u32 {
     poster_dim(h, true)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_poster_height(h: *mut GifCore) -> u32 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_poster_height(h: *mut GifCore) -> u32 {
     poster_dim(h, false)
 }
 
@@ -697,16 +772,19 @@ fn poster_dim(h: *mut GifCore, width: bool) -> u32 {
 
 /// Decode `count` timeline thumbnails, each at most `thumb_w` pixels wide.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_build_filmstrip(h: *mut GifCore, count: u32, thumb_w: u32) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_build_filmstrip(h: *mut GifCore, count: u32, thumb_w: u32) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
-        let (tools, info) = {
+        let (tools, info, generation) = {
             let st = core.state.lock().map_err(lock_err)?;
             let info = st
                 .info
                 .clone()
                 .ok_or_else(|| Error::Invalid("no video is loaded".into()))?;
-            (st.tools.clone(), info)
+            (st.tools.clone(), info, st.generation)
         };
         let strip = frames::filmstrip(
             &tools,
@@ -717,6 +795,9 @@ pub extern "C" fn gif_build_filmstrip(h: *mut GifCore, count: u32, thumb_w: u32)
         )?;
 
         let mut st = core.state.lock().map_err(lock_err)?;
+        if st.generation != generation {
+            return Err(Error::Invalid("filmstrip request was superseded".into()));
+        }
         // Keep the pixel bytes alive in one contiguous allocation so the thumb
         // descriptors stay valid until the next rebuild.
         st.strip_pixels.clear();
@@ -751,7 +832,10 @@ pub extern "C" fn gif_build_filmstrip(h: *mut GifCore, count: u32, thumb_w: u32)
 
 /// The filmstrip built by [`gif_build_filmstrip`].
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_filmstrip(h: *mut GifCore) -> GifCoreFilmstrip {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_filmstrip(h: *mut GifCore) -> GifCoreFilmstrip {
     let empty = GifCoreFilmstrip {
         thumbs: std::ptr::null(),
         count: 0,
@@ -773,7 +857,10 @@ pub extern "C" fn gif_filmstrip(h: *mut GifCore) -> GifCoreFilmstrip {
 
 /// Pixels of thumbnail `i`, as a detached copy.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_thumb_rgb(h: *mut GifCore, index: u32) -> GifCoreBuffer {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_thumb_rgb(h: *mut GifCore, index: u32) -> GifCoreBuffer {
     let empty = GifCoreBuffer {
         data: std::ptr::null(),
         len: 0,
@@ -807,7 +894,10 @@ pub extern "C" fn gif_thumb_rgb(h: *mut GifCore, index: u32) -> GifCoreBuffer {
 ///
 /// Needs no loaded media: it only looks at the filesystem.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_check_output(h: *mut GifCore, out_path: *const c_char) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_check_output(h: *mut GifCore, out_path: *const c_char) -> c_int {
     guard(|| {
         let _core = unsafe { as_handle(h) }?;
         let text = to_str(out_path)?;
@@ -832,8 +922,8 @@ pub extern "C" fn gif_check_output(h: *mut GifCore, out_path: *const c_char) -> 
 /// clamped down to it.
 /// Every knob of an export, so the argument list stops growing.
 ///
-/// Zero means "use the documented default", which lets a caller memset the
-/// struct and set only what it cares about.
+/// Zero selects the documented defaults except for dither_strength, whose zero
+/// explicitly disables dithering in ABI 7. Default initializes strength to 100.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GifCoreExportOptions {
@@ -855,7 +945,7 @@ pub struct GifCoreExportOptions {
     pub quality: u32,
     /// 「有损压缩」 0..=100: coarse colour grid before quantising.
     pub lossy: u32,
-    /// 「抖动强度」 0..=100; `0` means 100.
+    /// 「抖动强度」 0..=100; zero disables dithering (ABI 7).
     pub dither_strength: u32,
     /// 「复用重复帧」: fold identical consecutive frames together.
     pub dedupe: c_int,
@@ -877,7 +967,7 @@ impl Default for GifCoreExportOptions {
             threads: 0,
             quality: 0,
             lossy: 0,
-            dither_strength: 0,
+            dither_strength: 100,
             dedupe: 0,
             optimize: 0,
             tolerance: 0,
@@ -919,12 +1009,14 @@ fn settings_from(
     };
     Ok(Settings {
         input: PathBuf::from(&info.path),
+        video_stream: info.video_stream,
+        seek_offset: info.start_time - info.format_start_time,
         output,
         start,
         end,
-        fps: if o.fps > 0.0 { o.fps } else { 12.0 },
+        fps: if o.fps == 0.0 { 12.0 } else { o.fps },
         max_width: if o.max_width > 0 { o.max_width } else { 480 },
-        speed: if o.speed > 0.0 { o.speed } else { 1.0 },
+        speed: if o.speed == 0.0 { 1.0 } else { o.speed },
         colors: if o.colors > 0 { o.colors } else { 256 },
         dither: dither_mode,
         loop_forever: o.loop_forever != 0,
@@ -936,11 +1028,7 @@ fn settings_from(
             export::DEFAULT_QUALITY
         },
         lossy: o.lossy.min(100),
-        dither_strength: if o.dither_strength == 0 {
-            100
-        } else {
-            o.dither_strength.min(100)
-        },
+        dither_strength: o.dither_strength.min(100),
         dedupe: o.dedupe != 0,
         optimize: o.optimize != 0,
         tolerance: o.tolerance.min(64),
@@ -960,7 +1048,10 @@ fn read_options(opts: *const GifCoreExportOptions) -> GifCoreExportOptions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_export(
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_export(
     h: *mut GifCore,
     out_path: *const c_char,
     fps: f64,
@@ -981,14 +1072,24 @@ pub extern "C" fn gif_export(
         threads,
         ..GifCoreExportOptions::default()
     };
-    gif_export_ex(h, out_path, &options)
+    unsafe { gif_export_ex(h, out_path, &options) }
 }
 
-/// Clears the "busy" flag however the operation ends — including the early `?`
-/// returns below and a panic caught by [`guard`]. Storing `false` by hand after
+/// Clears the "busy" flag however the operation ends — including early errors and unwinding through [`guard`]. Storing `false` by hand after
 /// the work missed those paths, so one bad call left `gif_is_exporting`
 /// reporting `1` for the rest of the session.
 struct Running<'a>(&'a AtomicBool);
+
+impl<'a> Running<'a> {
+    fn acquire(core: &'a GifCore) -> Result<Running<'a>, Error> {
+        let _state = core.state.lock().map_err(lock_err)?;
+        core.running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| Error::Busy)?;
+        core.cancel.store(false, Ordering::SeqCst);
+        Ok(Running(&core.running))
+    }
+}
 
 impl Drop for Running<'_> {
     fn drop(&mut self) {
@@ -998,7 +1099,10 @@ impl Drop for Running<'_> {
 
 /// [`gif_export`], with the advanced settings included.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_export_ex(
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_export_ex(
     h: *mut GifCore,
     out_path: *const c_char,
     opts: *const GifCoreExportOptions,
@@ -1011,9 +1115,7 @@ pub extern "C" fn gif_export_ex(
         }
         let options = read_options(opts);
 
-        core.cancel.store(false, Ordering::SeqCst);
-        core.running.store(true, Ordering::SeqCst);
-        let _running = Running(&core.running);
+        let _running = Running::acquire(core)?;
         *core.export_error.lock().map_err(lock_err)? = None;
 
         let result = {
@@ -1022,14 +1124,8 @@ pub extern "C" fn gif_export_ex(
                 .info
                 .clone()
                 .ok_or_else(|| Error::Invalid("no video is loaded".into()))?;
-            let settings = settings_from(
-                core,
-                &info,
-                PathBuf::from(&out),
-                st.start,
-                st.end,
-                &options,
-            )?;
+            let settings =
+                settings_from(core, &info, PathBuf::from(&out), st.start, st.end, &options)?;
             let tools = st.tools.clone();
             drop(st);
             export::export(&tools, &settings, &core.progress)
@@ -1056,7 +1152,10 @@ pub extern "C" fn gif_export_ex(
 /// the palette size — and extrapolates. Meant to be called from a worker
 /// thread: it decodes video and blocks for a fraction of a second.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_estimate_size(
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_estimate_size(
     h: *mut GifCore,
     opts: *const GifCoreExportOptions,
     out: *mut GifCoreEstimate,
@@ -1068,11 +1167,8 @@ pub extern "C" fn gif_estimate_size(
         }
         let options = read_options(opts);
 
-        // An estimate is short, so it is never cancelled from underneath; the
-        // front end simply ignores a result it has already superseded.
-        core.cancel.store(false, Ordering::SeqCst);
-        core.running.store(true, Ordering::SeqCst);
-        let _running = Running(&core.running);
+        // Estimates are ordinary cancellable jobs and cannot overlap an export.
+        let _running = Running::acquire(core)?;
         *core.export_error.lock().map_err(lock_err)? = None;
 
         let result = {
@@ -1081,14 +1177,7 @@ pub extern "C" fn gif_estimate_size(
                 .info
                 .clone()
                 .ok_or_else(|| Error::Invalid("no video is loaded".into()))?;
-            let settings = settings_from(
-                core,
-                &info,
-                PathBuf::new(),
-                st.start,
-                st.end,
-                &options,
-            )?;
+            let settings = settings_from(core, &info, PathBuf::new(), st.start, st.end, &options)?;
             let tools = st.tools.clone();
             drop(st);
             export::estimate(&tools, &settings, &core.progress)
@@ -1120,9 +1209,13 @@ pub extern "C" fn gif_estimate_size(
 
 /// Ask a running export to stop. It is checked between frames.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_cancel(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_cancel(h: *mut GifCore) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
+        let _state = core.state.lock().map_err(lock_err)?;
         core.cancel.store(true, Ordering::SeqCst);
         Ok(GIF_OK)
     })
@@ -1130,7 +1223,10 @@ pub extern "C" fn gif_cancel(h: *mut GifCore) -> c_int {
 
 /// Whether an export is currently running.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_is_exporting(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_is_exporting(h: *mut GifCore) -> c_int {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0;
     };
@@ -1139,7 +1235,10 @@ pub extern "C" fn gif_is_exporting(h: *mut GifCore) -> c_int {
 
 /// Progress as a fraction in 0..=1.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_progress(h: *mut GifCore) -> f64 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_progress(h: *mut GifCore) -> f64 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return 0.0;
     };
@@ -1148,7 +1247,10 @@ pub extern "C" fn gif_progress(h: *mut GifCore) -> f64 {
 
 /// Current phase code. See the `GIF_PHASE_*` constants in the header.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_progress_phase(h: *mut GifCore) -> u32 {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_progress_phase(h: *mut GifCore) -> u32 {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return export::PHASE_IDLE;
     };
@@ -1157,7 +1259,10 @@ pub extern "C" fn gif_progress_phase(h: *mut GifCore) -> u32 {
 
 /// Human readable phase name. Static, never freed.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_progress_phase_name(h: *mut GifCore) -> *const c_char {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_progress_phase_name(h: *mut GifCore) -> *const c_char {
     static NAMES: [&str; 6] = [
         "Idle\0",
         "Decoding frames\0",
@@ -1175,7 +1280,10 @@ pub extern "C" fn gif_progress_phase_name(h: *mut GifCore) -> *const c_char {
 
 /// Results of the most recent successful export.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_last_result(h: *mut GifCore) -> GifCoreExportResult {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_last_result(h: *mut GifCore) -> GifCoreExportResult {
     let zero = GifCoreExportResult {
         frames: 0,
         bytes: 0,
@@ -1210,7 +1318,10 @@ pub extern "C" fn gif_last_result(h: *mut GifCore) -> GifCoreExportResult {
 
 /// A one-line summary of the last export, e.g. `120 frames · 480x270 · …`.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_last_result_summary(h: *mut GifCore) -> *const c_char {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_last_result_summary(h: *mut GifCore) -> *const c_char {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return std::ptr::null();
     };
@@ -1231,7 +1342,10 @@ pub extern "C" fn gif_last_result_summary(h: *mut GifCore) -> *const c_char {
 
 /// Warning from the last export, or an empty string.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_last_warning(h: *mut GifCore) -> *const c_char {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_last_warning(h: *mut GifCore) -> *const c_char {
     let Ok(core) = (unsafe { as_handle(h) }) else {
         return std::ptr::null();
     };
@@ -1255,7 +1369,10 @@ pub extern "C" fn gif_last_warning(h: *mut GifCore) -> *const c_char {
 
 /// Reset the progress meter to idle.
 #[unsafe(no_mangle)]
-pub extern "C" fn gif_reset_progress(h: *mut GifCore) -> c_int {
+/// # Safety
+/// Pointer arguments must be valid for the call. A handle must remain alive; borrowed
+/// buffers must be copied before concurrent mutation. Destroy only after all calls finish.
+pub unsafe extern "C" fn gif_reset_progress(h: *mut GifCore) -> c_int {
     guard(|| {
         let core = unsafe { as_handle(h) }?;
         core.progress.finish(export::PHASE_IDLE);
@@ -1273,43 +1390,43 @@ mod tests {
         let h = gif_create();
         assert!(!h.is_null());
         assert_eq!(gif_abi_version(), ABI_VERSION);
-        assert_eq!(gif_has_media(h), 0);
-        assert_eq!(gif_width(h), 0);
-        assert_eq!(gif_duration(h), 0.0);
-        assert!(gif_build_filmstrip(h, 8, 160) != GIF_OK);
+        assert_eq!(unsafe { gif_has_media(h) }, 0);
+        assert_eq!(unsafe { gif_width(h) }, 0);
+        assert_eq!(unsafe { gif_duration(h) }, 0.0);
+        assert!(unsafe { gif_build_filmstrip(h, 8, 160) } != GIF_OK);
         // The error slot must be readable after a failure.
         let msg = unsafe { std::ffi::CStr::from_ptr(gif_last_error(h)) };
         assert!(!msg.to_bytes().is_empty());
-        gif_destroy(h);
+        unsafe { gif_destroy(h) };
         // Destroying null is a no-op.
-        gif_destroy(std::ptr::null_mut());
+        unsafe { gif_destroy(std::ptr::null_mut()) };
     }
 
     #[test]
     fn selection_requires_media() {
         let h = gif_create();
-        assert_ne!(gif_set_selection(h, 1.0, 2.0), GIF_OK);
-        assert_eq!(gif_selection_duration(h), 0.0);
-        gif_destroy(h);
+        assert_ne!(unsafe { gif_set_selection(h, 1.0, 2.0) }, GIF_OK);
+        assert_eq!(unsafe { gif_selection_duration(h) }, 0.0);
+        unsafe { gif_destroy(h) };
     }
 
     #[test]
     fn null_handle_is_tolerated() {
         let n = std::ptr::null_mut();
-        assert_eq!(gif_has_media(n), 0);
-        assert_eq!(gif_duration(n), 0.0);
-        assert_eq!(gif_progress(n), 0.0);
-        gif_destroy(n);
+        assert_eq!(unsafe { gif_has_media(n) }, 0);
+        assert_eq!(unsafe { gif_duration(n) }, 0.0);
+        assert_eq!(unsafe { gif_progress(n) }, 0.0);
+        unsafe { gif_destroy(n) };
     }
 
     #[test]
     fn progress_helpers() {
         let h = gif_create();
-        gif_reset_progress(h);
-        assert_eq!(gif_progress(h), 0.0);
+        unsafe { gif_reset_progress(h) };
+        assert_eq!(unsafe { gif_progress(h) }, 0.0);
         let name = unsafe { std::ffi::CStr::from_ptr(gif_progress_phase_name(h)) };
         assert!(!name.to_bytes().is_empty());
-        gif_destroy(h);
+        unsafe { gif_destroy(h) };
     }
 
     #[test]
@@ -1320,28 +1437,30 @@ mod tests {
         // gif_is_exporting() reported 1 for the rest of the session.
         let out = b"out.gif\0";
         assert_ne!(
-            gif_export(
-                h,
-                out.as_ptr() as *const c_char,
-                12.0,
-                480,
-                256,
-                std::ptr::null(),
-                1.0,
-                1,
-                1
-            ),
+            unsafe {
+                gif_export(
+                    h,
+                    out.as_ptr() as *const c_char,
+                    12.0,
+                    480,
+                    256,
+                    std::ptr::null(),
+                    1.0,
+                    1,
+                    1,
+                )
+            },
             GIF_OK
         );
-        assert_eq!(gif_is_exporting(h), 0);
+        assert_eq!(unsafe { gif_is_exporting(h) }, 0);
 
         let mut estimate = GifCoreEstimate::default();
         assert_ne!(
-            gif_estimate_size(h, std::ptr::null(), &mut estimate),
+            unsafe { gif_estimate_size(h, std::ptr::null(), &mut estimate) },
             GIF_OK
         );
-        assert_eq!(gif_is_exporting(h), 0);
-        gif_destroy(h);
+        assert_eq!(unsafe { gif_is_exporting(h) }, 0);
+        unsafe { gif_destroy(h) };
     }
 
     #[test]
@@ -1349,5 +1468,35 @@ mod tests {
         let v = unsafe { std::ffi::CStr::from_ptr(gif_version()) };
         let s = v.to_str().unwrap();
         assert!(s.starts_with("gifcore "));
+    }
+    #[test]
+    fn a_busy_job_cannot_reset_another_jobs_cancellation() {
+        let h = gif_create();
+        let core = unsafe { &*h };
+        let running = Running::acquire(core).unwrap();
+        assert_eq!(unsafe { gif_cancel(h) }, GIF_OK);
+        let mut estimate = GifCoreEstimate::default();
+        assert_eq!(
+            unsafe { gif_estimate_size(h, std::ptr::null(), &mut estimate) },
+            GIF_ERR_BUSY
+        );
+        assert!(core.cancel.load(Ordering::SeqCst));
+        assert_eq!(unsafe { gif_is_exporting(h) }, 1);
+        drop(running);
+        assert_eq!(unsafe { gif_is_exporting(h) }, 0);
+        unsafe { gif_destroy(h) };
+    }
+
+    #[test]
+    fn panics_are_contained_at_the_status_boundary_and_release_busy_state() {
+        let h = gif_create();
+        let core = unsafe { &*h };
+        let status = guard(|| {
+            let _running = Running::acquire(core)?;
+            panic!("intentional boundary test")
+        });
+        assert_eq!(status, GIF_ERR_UNKNOWN);
+        assert!(!core.running.load(Ordering::SeqCst));
+        unsafe { gif_destroy(h) };
     }
 }

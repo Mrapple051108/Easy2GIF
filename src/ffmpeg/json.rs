@@ -67,17 +67,24 @@ impl Json {
 
 pub fn parse(text: &str) -> Result<Json> {
     let bytes = text.as_bytes();
-    let mut p = Parser { b: bytes, i: 0 };
+    let mut p = Parser {
+        b: bytes,
+        i: 0,
+        depth: 0,
+    };
     p.skip_ws();
     let v = p.value()?;
     p.skip_ws();
-    // Trailing content is tolerated: ffprobe output is trusted enough.
+    if p.i != bytes.len() {
+        return Err(Error::BadMedia("trailing JSON content".into()));
+    }
     Ok(v)
 }
 
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -116,8 +123,12 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Json> {
+        if self.depth >= 128 {
+            return Err(Error::BadMedia("JSON nesting is too deep".into()));
+        }
+        self.depth += 1;
         self.skip_ws();
-        match self.peek() {
+        let result = match self.peek() {
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
             Some(b'"') => Ok(Json::Str(self.string()?)),
@@ -135,16 +146,22 @@ impl<'a> Parser<'a> {
             }
             Some(_) => self.number(),
             None => Err(Error::BadMedia("unexpected end of JSON".into())),
-        }
+        };
+        self.depth -= 1;
+        result
     }
 
     fn literal(&mut self, lit: &str) -> Result<()> {
-        if self.b.len() >= self.i + lit.len() && &self.b[self.i..self.i + lit.len()] == lit.as_bytes()
+        if self.b.len() >= self.i + lit.len()
+            && &self.b[self.i..self.i + lit.len()] == lit.as_bytes()
         {
             self.i += lit.len();
             Ok(())
         } else {
-            Err(Error::BadMedia(format!("malformed JSON literal at byte {}", self.i)))
+            Err(Error::BadMedia(format!(
+                "malformed JSON literal at byte {}",
+                self.i
+            )))
         }
     }
 
@@ -224,20 +241,30 @@ impl<'a> Parser<'a> {
                                     self.i += 1;
                                     self.expect(b'u')?;
                                     let lo = self.hex4()?;
+                                    if !(0xDC00..=0xDFFF).contains(&lo) {
+                                        return Err(Error::BadMedia(
+                                            "invalid low surrogate".into(),
+                                        ));
+                                    }
                                     let c = 0x10000
                                         + (((cp - 0xD800) as u32) << 10)
                                         + (lo - 0xDC00) as u32;
                                     if let Some(ch) = char::from_u32(c) {
                                         s.push(ch);
                                     }
+                                } else {
+                                    return Err(Error::BadMedia("missing low surrogate".into()));
                                 }
                             } else if let Some(ch) = char::from_u32(cp as u32) {
                                 s.push(ch);
+                            } else {
+                                return Err(Error::BadMedia("invalid surrogate".into()));
                             }
                         }
                         _ => return Err(Error::BadMedia("bad JSON escape".into())),
                     }
                 }
+                0..=31 => return Err(Error::BadMedia("unescaped control character".into())),
                 _ => {
                     // Collect the raw UTF-8 sequence.
                     let start = self.i - 1;
@@ -292,8 +319,10 @@ impl<'a> Parser<'a> {
         let text = std::str::from_utf8(&self.b[start..self.i])
             .map_err(|_| Error::BadMedia("bad JSON number".into()))?;
         text.parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
             .map(Json::Num)
-            .map_err(|_| Error::BadMedia(format!("bad JSON number '{text}'")))
+            .ok_or_else(|| Error::BadMedia("invalid or non-finite JSON number".into()))
     }
 }
 
@@ -346,5 +375,12 @@ mod tests {
         assert_eq!(parse_rational("25/1"), Some(25.0));
         assert_eq!(parse_rational("0/0"), None);
         assert_eq!(parse_rational("N/A"), None);
+    }
+    #[test]
+    fn rejects_invalid_surrogates_nonfinite_numbers_and_excessive_depth() {
+        for text in [r#""\uD800\u0000""#, r#""\uDC00""#, "1e999", "{} garbage"] {
+            assert!(parse(text).is_err(), "{text}");
+        }
+        assert!(parse(&format!("{}0{}", "[".repeat(200), "]".repeat(200))).is_err());
     }
 }

@@ -10,6 +10,11 @@ use crate::error::{Error, Result};
 pub struct MediaInfo {
     pub path: String,
     pub width: u32,
+    /// Absolute stream index shared by every decoding command.
+    pub video_stream: u32,
+    pub start_time: f64,
+    pub format_start_time: f64,
+    pub sample_aspect: f64,
     pub height: u32,
     /// Exact average frame rate, e.g. 29.97002997.
     pub fps: f64,
@@ -31,6 +36,11 @@ impl MediaInfo {
             1.0
         } else {
             self.width as f64 / self.height as f64
+                * if self.sample_aspect > 0.0 {
+                    self.sample_aspect
+                } else {
+                    1.0
+                }
         }
     }
 
@@ -72,14 +82,22 @@ impl MediaInfo {
 
     /// Whether there is enough information to do useful work.
     pub fn is_usable(&self) -> bool {
-        self.width > 0 && self.height > 0 && self.duration > 0.0
+        self.width > 0 && self.height > 0 && self.duration.is_finite() && self.duration > 0.0
     }
 }
 
 /// Round a raw fps to a common friendly value when it is close enough.
 pub fn friendly_fps(fps: f64) -> f64 {
     const COMMON: [f64; 9] = [
-        23.976023976, 24.0, 25.0, 29.97002997, 30.0, 48.0, 50.0, 59.94005994, 60.0,
+        23.976023976,
+        24.0,
+        25.0,
+        29.97002997,
+        30.0,
+        48.0,
+        50.0,
+        59.94005994,
+        60.0,
     ];
     for c in COMMON {
         if (fps - c).abs() < 0.02 {
@@ -98,6 +116,19 @@ pub fn probe(tools: &MediaTools, path: &Path) -> Result<MediaInfo> {
         )));
     }
     let text = tools.probe_json(path)?;
+    parse_info(path, &text)
+}
+
+pub fn probe_with_cancel(
+    tools: &MediaTools,
+    path: &Path,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<MediaInfo> {
+    let text = tools.probe_json_cancel(path, cancel)?;
+    parse_info(path, &text)
+}
+
+fn parse_info(path: &Path, text: &str) -> Result<MediaInfo> {
     let root = json::parse(&text)?;
 
     let streams = root
@@ -111,13 +142,17 @@ pub fn probe(tools: &MediaTools, path: &Path) -> Result<MediaInfo> {
     };
 
     let format = root.get("format");
+    info.format_start_time = format
+        .and_then(|f| f.f64_field("start_time"))
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
     if let Some(d) = format.and_then(|f| f.f64_field("duration")) {
         info.duration = d;
     }
 
     let mut found_video = false;
 
-    for s in streams {
+    for (ordinal, s) in streams.iter().enumerate() {
         let codec_type = s.str_field("codec_type").unwrap_or("");
         match codec_type {
             "video" => {
@@ -127,13 +162,22 @@ pub fn probe(tools: &MediaTools, path: &Path) -> Result<MediaInfo> {
                     .and_then(|d| d.f64_field("attached_pic"))
                     .map(|v| v == 1.0)
                     .unwrap_or(false);
-                if is_attached && found_video {
+                if is_attached {
                     continue;
                 }
                 if found_video {
                     continue; // first real video stream wins
                 }
                 found_video = true;
+                info.video_stream = s.f64_field("index").unwrap_or(ordinal as f64) as u32;
+                info.start_time = s
+                    .f64_field("start_time")
+                    .filter(|v| v.is_finite())
+                    .unwrap_or(0.0);
+                info.sample_aspect = s
+                    .str_field("sample_aspect_ratio")
+                    .and_then(|v| json::parse_rational(&v.replace(':', "/")))
+                    .unwrap_or(1.0);
 
                 info.width = s.f64_field("width").unwrap_or(0.0) as u32;
                 info.height = s.f64_field("height").unwrap_or(0.0) as u32;
@@ -155,10 +199,23 @@ pub fn probe(tools: &MediaTools, path: &Path) -> Result<MediaInfo> {
                     info.frame_count = fc;
                 }
 
-                // A stream duration can rescue files with a broken container duration.
-                if info.duration <= 0.0 {
-                    if let Some(d) = s.f64_field("duration") {
-                        info.duration = d;
+                // The selected video, rather than a longer audio track, owns the range.
+                if let Some(d) = s
+                    .f64_field("duration")
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                {
+                    info.duration = d;
+                } else if info.frame_count > 0 && info.fps > 0.0 {
+                    info.duration = info.frame_count as f64 / info.fps;
+                } else if let Some(d) = s.get("tags").and_then(|t| t.str_field("DURATION")) {
+                    let parts: Option<Vec<f64>> = d.split(':').map(|p| p.parse().ok()).collect();
+                    if let Some(parts) = parts.filter(|p| p.len() == 3) {
+                        // Matroska's DURATION tag is the stream endpoint, including its PTS offset.
+                        let duration =
+                            parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] - info.start_time;
+                        if duration.is_finite() && duration > 0.0 {
+                            info.duration = duration;
+                        }
                     }
                 }
 
@@ -175,9 +232,7 @@ pub fn probe(tools: &MediaTools, path: &Path) -> Result<MediaInfo> {
     }
 
     if !found_video {
-        return Err(Error::BadMedia(
-            "no video stream found in this file".into(),
-        ));
+        return Err(Error::BadMedia("no video stream found in this file".into()));
     }
 
     // Derive a duration from frame count when the container does not give one.
@@ -188,6 +243,7 @@ pub fn probe(tools: &MediaTools, path: &Path) -> Result<MediaInfo> {
     // A 90/270 rotation swaps the displayed dimensions.
     if info.rotation == 90 || info.rotation == 270 {
         std::mem::swap(&mut info.width, &mut info.height);
+        info.sample_aspect = 1.0 / info.sample_aspect;
     }
 
     if !info.is_usable() {
@@ -249,5 +305,30 @@ mod tests {
         assert_eq!(m.time_to_frame(1.99), 49);
         assert_eq!(m.total_frames(), 100);
         assert!((m.frame_time(0) - 0.02).abs() < 1e-9);
+    }
+    #[test]
+    fn attached_picture_does_not_hide_the_real_video_or_use_audio_duration() {
+        let info=parse_info(Path::new("fixture"),r#"{"format":{"duration":"20"},"streams":[
+            {"index":0,"codec_type":"video","width":300,"height":300,"disposition":{"attached_pic":1}},
+            {"index":2,"codec_type":"video","width":32,"height":24,"duration":"2","avg_frame_rate":"10/1"}
+        ]}"#).unwrap();
+        assert_eq!((info.video_stream, info.width, info.height), (2, 32, 24));
+        assert_eq!(info.duration, 2.0);
+    }
+
+    #[test]
+    fn matroska_duration_tag_excludes_the_stream_timestamp_offset() {
+        let info = parse_info(
+            Path::new("shifted.mkv"),
+            r#"{
+            "format":{"start_time":"3","duration":"5"},
+            "streams":[{"index":0,"codec_type":"video","width":32,"height":24,
+                "start_time":"3","avg_frame_rate":"10/1",
+                "tags":{"DURATION":"00:00:05.000000000"}}]
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(info.duration, 2.0);
+        assert_eq!(info.start_time, 3.0);
     }
 }
