@@ -134,6 +134,7 @@ class GifBridge : public QObject
     Q_PROPERTY(QString coreVersion READ coreVersion CONSTANT)
     Q_PROPERTY(QString toolsStatus READ toolsStatus NOTIFY toolsChanged)
     Q_PROPERTY(bool toolsReady READ toolsReady NOTIFY toolsChanged)
+    Q_PROPERTY(bool darkMode READ darkMode WRITE setDarkMode NOTIFY themeChanged)
     /// True when this process runs at Low integrity, i.e. it was started by a
     /// sandboxed or otherwise restricted launcher. Windows then refuses every
     /// write to an ordinary folder whatever its ACL says, so the UI says so up
@@ -296,6 +297,8 @@ public:
     QString coreVersion() const { return m_coreVersion; }
     QString toolsStatus() const { return m_toolsStatus; }
     bool toolsReady() const { return m_toolsReady; }
+    bool darkMode() const { return m_darkMode; }
+    void setDarkMode(bool dark);
 
 signals:
     void mediaChanged();
@@ -307,6 +310,7 @@ signals:
     void progressChanged();
     void resultChanged();
     void toolsChanged();
+    void themeChanged();
     /// The save folder or file name changed, so the target and its write check
     /// both moved.
     void outputChanged();
@@ -364,6 +368,7 @@ private:
     void clearEstimate();
 
     GifCore *m_core = nullptr;
+    bool m_darkMode = false;
 
     // media snapshot
     bool m_mediaLoaded = false;

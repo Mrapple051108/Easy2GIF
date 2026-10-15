@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
+#include <QSettings>
 #include <QUrl>
 
 #include <algorithm>
@@ -151,6 +152,7 @@ QImage GifImageProvider::requestImage(const QString &id, QSize *size,
 GifBridge::GifBridge(QObject *parent)
     : QObject(parent)
 {
+    m_darkMode = QSettings().value(QStringLiteral("appearance/darkMode"), false).toBool();
     m_core = gif_create();
     if (m_core) {
         m_coreVersion = QString::fromUtf8(gif_version());
@@ -176,6 +178,16 @@ GifBridge::GifBridge(QObject *parent)
     connect(this, &GifBridge::settingsChanged, this, &GifBridge::scheduleEstimate);
     connect(this, &GifBridge::selectionChanged, this, &GifBridge::scheduleEstimate);
     connect(this, &GifBridge::mediaChanged, this, &GifBridge::scheduleEstimate);
+}
+
+void GifBridge::setDarkMode(bool dark)
+{
+    if (m_darkMode == dark) {
+        return;
+    }
+    m_darkMode = dark;
+    QSettings().setValue(QStringLiteral("appearance/darkMode"), dark);
+    emit themeChanged();
 }
 
 GifBridge::~GifBridge()
