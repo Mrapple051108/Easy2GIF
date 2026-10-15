@@ -85,6 +85,9 @@ add_custom_command(
             "${GIFCORE_CARGO_EXECUTABLE}" build --release --offline --lib --bin forge
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
     DEPENDS ${GIFCORE_RUST_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
+            "${CMAKE_CURRENT_SOURCE_DIR}/build.rs"
+            "${CMAKE_CURRENT_SOURCE_DIR}/app/windows.rc"
+            "${CMAKE_CURRENT_SOURCE_DIR}/app/assets/easy2gif.ico"
     COMMENT "Building the Rust kernel and launcher (gifcore, release)"
     VERBATIM)
 

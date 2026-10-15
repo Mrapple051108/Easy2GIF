@@ -28,6 +28,9 @@ if (!$SkipBuild) {
 foreach ($rel in @('easy2gif.exe', 'forge.exe', 'qt.conf', 'bin\media-runtime.txt')) {
     if (!(Test-Path (Join-Path $bundle $rel))) { throw "Missing bundle file: $rel" }
 }
+& (Join-Path $root 'tools\test-app-icons.ps1') `
+    -Executable @((Join-Path $bundle 'easy2gif.exe'), (Join-Path $bundle 'forge.exe')) `
+    -Icon (Join-Path $root 'app\assets\easy2gif.ico')
 $commit = (& git -C $root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot determine source revision.' }
 $dirty = [bool](& git -C $root status --porcelain --untracked-files=normal)
