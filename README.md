@@ -27,6 +27,8 @@ Easy2GIF 是一款适用于 **Windows x64** 的视频转 GIF 工具。预览画�
 
 ## 开始使用
 
+前往 [Releases 下载最新版本](https://github.com/Mrapple051108/Easy2GIF/releases/latest)。
+
 1. 将 Windows x64 版本的 7z 压缩包**完整解压**，打开带版本号的程序文件夹。
 2. 运行 `easy2gif.exe`，点击右上角「打开视频」，或按 `Ctrl+O` 导入。
 3. 通过时间轴或「开始」「结束」输入框选取要转换的片段。
