@@ -371,7 +371,7 @@ ApplicationWindow {
     }
     Shortcut {
         sequences: [StandardKey.Open]
-        onActivated: if (!gif.exporting)
+        onActivated: if (!gif.exporting && !gif.importing)
             openDialog.open()
     }
 
@@ -439,7 +439,7 @@ ApplicationWindow {
                 text: qsTr("打开视频")
                 symbol: "+"
                 highlighted: true
-                enabled: !gif.exporting
+                enabled: !gif.exporting && !gif.importing
                 onClicked: openDialog.open()
             }
         }
@@ -496,7 +496,7 @@ ApplicationWindow {
                         }
                         MouseArea {
                             anchors.fill: parent
-                            enabled: !gif.mediaLoaded
+                            enabled: !gif.mediaLoaded && !gif.importing
                             cursorShape: Qt.PointingHandCursor
                             onClicked: openDialog.open()
                         }
@@ -520,7 +520,7 @@ ApplicationWindow {
                             implicitHeight: 28
                             implicitWidth: 52
                             flat: true
-                            enabled: gif.mediaLoaded && !gif.exporting
+                            enabled: gif.mediaLoaded && !gif.exporting && !gif.importing
                             onClicked: gif.closeVideo()
                         }
                     }
@@ -642,7 +642,7 @@ ApplicationWindow {
                                     implicitHeight: 28
                                     implicitWidth: 56
                                     flat: true
-                                    enabled: gif.mediaLoaded && !gif.exporting
+                                    enabled: gif.mediaLoaded && !gif.exporting && !gif.importing
                                     onClicked: gif.selectWholeClip()
                                 }
                                 FlatButton {
@@ -650,7 +650,7 @@ ApplicationWindow {
                                     implicitHeight: 28
                                     implicitWidth: 56
                                     flat: true
-                                    enabled: gif.mediaLoaded && !gif.exporting
+                                    enabled: gif.mediaLoaded && !gif.exporting && !gif.importing
                                     onClicked: gif.clearSelection()
                                 }
                             }
@@ -721,7 +721,7 @@ ApplicationWindow {
                                 }
                                 MouseArea {
                                     anchors.fill: parent
-                                    enabled: gif.mediaLoaded && !gif.exporting
+                                    enabled: gif.mediaLoaded && !gif.exporting && !gif.importing
                                     cursorShape: Qt.SizeHorCursor
                                     property bool grabbingStart: true
                                     function fractionAt(px) {
@@ -757,7 +757,7 @@ ApplicationWindow {
                             fraction: gif.startFraction
                             timeText: gif.startTimeText
                             frameText: gif.startFrameText
-                            enabled: gif.mediaLoaded && !gif.exporting
+                            enabled: gif.mediaLoaded && !gif.exporting && !gif.importing
                             onMoved: function (f) {
                                 gif.setStartFraction(f);
                             }
@@ -781,7 +781,7 @@ ApplicationWindow {
                             fraction: gif.endFraction
                             timeText: gif.endTimeText
                             frameText: gif.endFrameText
-                            enabled: gif.mediaLoaded && !gif.exporting
+                            enabled: gif.mediaLoaded && !gif.exporting && !gif.importing
                             onMoved: function (f) {
                                 gif.setEndFraction(f);
                             }
@@ -853,7 +853,7 @@ ApplicationWindow {
                             FlatCheck {
                                 text: qsTr("循环播放")
                                 checked: gif.loopForever
-                                enabled: !gif.exporting
+                                enabled: !gif.exporting && !gif.importing
                                 onToggled: gif.loopForever = checked
                             }
                         }
@@ -862,7 +862,7 @@ ApplicationWindow {
                             columns: 3
                             columnSpacing: 14
                             rowSpacing: 12
-                            enabled: !gif.exporting
+                            enabled: !gif.exporting && !gif.importing
                             OptionGroup {
                                 label: qsTr("帧率")
                                 FlatCombo {
@@ -971,7 +971,7 @@ ApplicationWindow {
                                     text: qsTr("恢复默认")
                                     implicitHeight: 28
                                     flat: true
-                                    enabled: !gif.exporting
+                                    enabled: !gif.exporting && !gif.importing
                                     onClicked: {
                                         gif.quality = 5;
                                         gif.lossy = 0;
@@ -985,7 +985,7 @@ ApplicationWindow {
                             ColumnLayout {
                                 visible: advancedToggle.checked
                                 Layout.fillWidth: true
-                                enabled: !gif.exporting
+                                enabled: !gif.exporting && !gif.importing
                                 spacing: 8
                                 AdvSlider {
                                     label: qsTr("编码质量")
@@ -1067,7 +1067,7 @@ ApplicationWindow {
                             columns: 3
                             columnSpacing: 10
                             rowSpacing: 8
-                            enabled: !gif.exporting
+                            enabled: !gif.exporting && !gif.importing
                             UiLabel {
                                 text: qsTr("保存到")
                                 color: window.textDim
@@ -1145,7 +1145,7 @@ ApplicationWindow {
                                 highlighted: true
                                 Layout.preferredWidth: 156
                                 Layout.preferredHeight: 40
-                                enabled: gif.mediaLoaded && !gif.exporting && gif.outputProblemText.length === 0
+                                enabled: gif.mediaLoaded && !gif.exporting && !gif.importing && gif.outputProblemText.length === 0
                                 onClicked: gif.startExportTo(gif.outputDir, gif.outputName)
                                 ToolTip.visible: hovered && gif.mediaLoaded
                                 ToolTip.text: gif.outputTargetText
@@ -1204,6 +1204,95 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
+        }
+    }
+    Popup {
+        id: importPopup
+        parent: Overlay.overlay
+        anchors.centerIn: parent
+        width: 380
+        padding: 24
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        background: Rectangle {
+            radius: 16
+            color: window.cardBg
+            border.color: window.cardLine
+        }
+        Overlay.modal: Rectangle {
+            color: window.dark ? "#99101318" : "#663b4058"
+        }
+        contentItem: ColumnLayout {
+            spacing: 16
+            UiLabel {
+                text: gif.importing ? qsTr("正在导入视频") : qsTr("导入完成")
+                font.pixelSize: 17
+                font.weight: Font.DemiBold
+                color: window.textMain
+            }
+            UiLabel {
+                Layout.fillWidth: true
+                text: gif.importFileName
+                elide: Text.ElideMiddle
+                color: window.textDim
+                font.pixelSize: 12
+            }
+            ProgressBar {
+                id: importBar
+                Layout.fillWidth: true
+                implicitHeight: 7
+                from: 0
+                to: 1
+                value: gif.importProgress
+                Accessible.name: qsTr("视频导入进度")
+                background: Rectangle {
+                    radius: 3.5
+                    color: window.trackBg
+                }
+                contentItem: Item {
+                    Rectangle {
+                        width: importBar.visualPosition * parent.width
+                        height: parent.height
+                        radius: 3.5
+                        color: window.accent
+                    }
+                }
+            }
+            RowLayout {
+                Layout.fillWidth: true
+                UiLabel {
+                    text: gif.importPhase
+                    color: window.textDim
+                    font.pixelSize: 12
+                    Layout.fillWidth: true
+                }
+                UiLabel {
+                    text: Math.round(gif.importProgress * 100) + "%"
+                    color: window.accent
+                    font.family: "Consolas"
+                    font.pixelSize: 16
+                }
+            }
+        }
+        Timer {
+            id: importDoneTimer
+            interval: 250
+            onTriggered: importPopup.close()
+        }
+        Connections {
+            target: gif
+            function onImportChanged() {
+                if (gif.importing) {
+                    importDoneTimer.stop();
+                    importPopup.open();
+                }
+            }
+            function onImportFinished(success) {
+                if (success)
+                    importDoneTimer.restart();
+                else
+                    importPopup.close();
             }
         }
     }

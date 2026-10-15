@@ -6,8 +6,7 @@
 // question about the media and every byte of pixel data comes from the kernel
 // through gifcore.h, and every command is forwarded straight back. The only
 // work done here is Qt-shaped glue — turning a raw RGB24 buffer into a QImage
-// the scene graph can draw, formatting numbers for labels, and running the one
-// blocking call (the export) off the GUI thread.
+// the scene graph can draw, formatting numbers for labels, and running blocking imports, exports and size estimates off the GUI thread.
 
 #include <QByteArray>
 #include <QImage>
@@ -45,6 +44,10 @@ class GifBridge : public QObject
 
     // --- media -----------------------------------------------------------
     Q_PROPERTY(bool mediaLoaded READ mediaLoaded NOTIFY mediaChanged)
+    Q_PROPERTY(bool importing READ importing NOTIFY importChanged)
+    Q_PROPERTY(double importProgress READ importProgress NOTIFY importChanged)
+    Q_PROPERTY(QString importPhase READ importPhase NOTIFY importChanged)
+    Q_PROPERTY(QString importFileName READ importFileName NOTIFY importChanged)
     Q_PROPERTY(QString videoPath READ videoPath NOTIFY mediaChanged)
     Q_PROPERTY(QString fileName READ fileName NOTIFY mediaChanged)
     Q_PROPERTY(QString videoCodec READ videoCodec NOTIFY mediaChanged)
@@ -148,6 +151,7 @@ public:
     ~GifBridge() override;
 
     // QML commands --------------------------------------------------------
+    /// Starts a background import; true means accepted, not yet completed.
     Q_INVOKABLE bool openVideo(const QString &pathOrUrl);
     Q_INVOKABLE void closeVideo();
 
@@ -299,9 +303,15 @@ public:
     bool toolsReady() const { return m_toolsReady; }
     bool darkMode() const { return m_darkMode; }
     void setDarkMode(bool dark);
+    bool importing() const { return m_importing; }
+    double importProgress() const { return m_importStage / 3.0; }
+    QString importPhase() const;
+    QString importFileName() const;
 
 signals:
     void mediaChanged();
+    void importChanged();
+    void importFinished(bool success);
     void selectionChanged();
     void posterChanged();
     void filmstripChanged();
@@ -366,9 +376,23 @@ private:
     void publishEstimate();
     /// Drop the projection, e.g. when the video is closed.
     void clearEstimate();
+    void publishImport();
 
     GifCore *m_core = nullptr;
     bool m_darkMode = false;
+
+    // Import into a separate handle so the current media and borrowed preview
+    // buffers remain untouched until every background operation has finished.
+    bool m_importing = false;
+    QString m_importPath;
+    int m_importStage = 0;
+    GifCore *m_importCore = nullptr;
+    std::thread m_importWorker;
+    std::atomic<int> m_importWorkerStage{0};
+    std::atomic<bool> m_importDone{false};
+    bool m_importOk = false; // read only after joining m_importWorker
+    QString m_importError;
+    QString m_importWarning;
 
     // media snapshot
     bool m_mediaLoaded = false;

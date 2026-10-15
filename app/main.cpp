@@ -122,64 +122,78 @@ int main(int argc, char *argv[])
         bridge.setThreadCount(options.threads);
     }
 
-    if (!options.open.isEmpty()) {
-        bridge.openVideo(options.open);
-    }
-
-    if (!options.log.isEmpty()) {
-        appendLog(options.log,
-                  QStringLiteral("tools ready=%1 (%2)")
-                      .arg(bridge.toolsReady() ? 1 : 0)
-                      .arg(bridge.toolsStatus()));
-        appendLog(options.log,
-                  QStringLiteral("media loaded=%1 error=%2")
-                      .arg(bridge.mediaLoaded() ? 1 : 0)
-                      .arg(bridge.lastError()));
-    }
-
-    if (!options.screenshot.isEmpty() || !options.exportTo.isEmpty()) {
-        auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
-        if (!window) {
-            appendLog(options.log, QStringLiteral("no root window"));
-            return -2;
-        }
-
-        if (!options.exportTo.isEmpty()) {
-            QObject::connect(
-                &bridge, &GifBridge::exportFinished, &app,
-                [&app, &options](bool ok, const QString &message) {
-                    qInfo("export %s: %s", ok ? "ok" : "failed",
-                          qUtf8Printable(message));
-                    appendLog(options.log,
-                              QStringLiteral("export %1: %2")
-                                  .arg(ok ? QStringLiteral("ok")
-                                          : QStringLiteral("FAILED"))
-                                  .arg(message));
-                    QTimer::singleShot(0, &app,
-                                       [&app, ok] { app.exit(ok ? 0 : 3); });
-                });
-            QTimer::singleShot(options.delay, &bridge, [&bridge, &options] {
-                bridge.startExport(options.exportTo);
-            });
-            return app.exec();
-        }
-
-        // Wait for the scene graph to settle before grabbing, then write the
-        // frame out and stop.
-        QTimer::singleShot(options.delay, &app, [&app, window, &options] {
-            const QImage shot = window->grabWindow();
-            const bool saved = !shot.isNull() && shot.save(options.screenshot);
-            qInfo("screenshot %s %dx%d", saved ? "ok" : "FAILED", shot.width(),
-                  shot.height());
+    // Import now runs in the background. Automation starts after completion,
+    // so --export and screenshots still operate on the requested media.
+    const auto runAutomation = [&app, &bridge, &engine, &options]() {
+        if (!options.log.isEmpty()) {
             appendLog(options.log,
-                      QStringLiteral("screenshot %1 %2x%3")
-                          .arg(saved ? QStringLiteral("ok")
-                                     : QStringLiteral("FAILED"))
-                          .arg(shot.width())
-                          .arg(shot.height()));
-            QTimer::singleShot(0, &app, [&app, saved] { app.exit(saved ? 0 : 4); });
-        });
-    }
+                      QStringLiteral("tools ready=%1 (%2)")
+                          .arg(bridge.toolsReady() ? 1 : 0)
+                          .arg(bridge.toolsStatus()));
+            appendLog(options.log,
+                      QStringLiteral("media loaded=%1 error=%2")
+                          .arg(bridge.mediaLoaded() ? 1 : 0)
+                          .arg(bridge.lastError()));
+        }
 
+        if (!options.screenshot.isEmpty() || !options.exportTo.isEmpty()) {
+            auto *window = qobject_cast<QQuickWindow *>(engine.rootObjects().constFirst());
+            if (!window) {
+                appendLog(options.log, QStringLiteral("no root window"));
+                app.exit(-2);
+                return;
+            }
+
+            if (!options.exportTo.isEmpty()) {
+                QObject::connect(
+                    &bridge, &GifBridge::exportFinished, &app,
+                    [&app, &options](bool ok, const QString &message) {
+                        qInfo("export %s: %s", ok ? "ok" : "failed",
+                              qUtf8Printable(message));
+                        appendLog(options.log,
+                                  QStringLiteral("export %1: %2")
+                                      .arg(ok ? QStringLiteral("ok")
+                                              : QStringLiteral("FAILED"))
+                                      .arg(message));
+                        QTimer::singleShot(0, &app,
+                                           [&app, ok] { app.exit(ok ? 0 : 3); });
+                    });
+                QTimer::singleShot(options.delay, &bridge, [&bridge, &options] {
+                    bridge.startExport(options.exportTo);
+                });
+                return;
+            }
+
+            // Wait for the scene graph to settle before grabbing, then write the
+            // frame out and stop.
+            QTimer::singleShot(options.delay, &app, [&app, window, &options] {
+                const QImage shot = window->grabWindow();
+                const bool saved = !shot.isNull() && shot.save(options.screenshot);
+                qInfo("screenshot %s %dx%d", saved ? "ok" : "FAILED", shot.width(),
+                      shot.height());
+                appendLog(options.log,
+                          QStringLiteral("screenshot %1 %2x%3")
+                              .arg(saved ? QStringLiteral("ok")
+                                         : QStringLiteral("FAILED"))
+                              .arg(shot.width())
+                              .arg(shot.height()));
+                QTimer::singleShot(0, &app, [&app, saved] { app.exit(saved ? 0 : 4); });
+            });
+        }
+    };
+    QObject::connect(&bridge, &GifBridge::importChanged, &app, [&bridge, &options] {
+        appendLog(options.log, QStringLiteral("import progress=%1 phase=%2")
+                                   .arg(qRound(bridge.importProgress() * 100))
+                                   .arg(bridge.importPhase()));
+    });
+    QObject::connect(&bridge, &GifBridge::importFinished, &app,
+                     [&options, &runAutomation](bool ok) {
+        appendLog(options.log, ok ? QStringLiteral("import ok")
+                                  : QStringLiteral("import FAILED"));
+        runAutomation();
+    });
+    if (options.open.isEmpty() || !bridge.openVideo(options.open)) {
+        runAutomation();
+    }
     return app.exec();
 }

@@ -193,6 +193,10 @@ void GifBridge::setDarkMode(bool dark)
 GifBridge::~GifBridge()
 {
     m_estimateTimer.stop();
+    if (m_importWorker.joinable()) {
+        m_importWorker.join();
+    }
+    gif_destroy(m_importCore);
     // A queued export must not start during teardown.
     m_startExportWhenIdle = nullptr;
     if (m_exporting) {
@@ -376,7 +380,7 @@ QString GifBridge::toLocalPath(const QString &urlOrPath) const
 
 bool GifBridge::openVideo(const QString &pathOrUrl)
 {
-    if (!m_core) {
+    if (!m_core || m_importing || m_exporting || m_startExportWhenIdle) {
         return false;
     }
 
@@ -388,42 +392,120 @@ bool GifBridge::openVideo(const QString &pathOrUrl)
         return false;
     }
 
-    m_posterTimer.stop();
-    m_filmstripCount = 0;
-
-    const gif_status status = gif_load(m_core, path.toUtf8().constData());
-    if (status != GIF_OK) {
-        fail(QStringLiteral("打开视频失败"));
-        emit filmstripChanged();
+    m_importCore = gif_create();
+    if (!m_importCore) {
+        m_lastError = QStringLiteral("无法创建视频导入任务");
+        emit resultChanged();
+        emit errorOccurred(m_lastError);
         return false;
     }
 
-    m_videoPath = path;
-    refreshMediaFromKernel();
-
-    // Offer the source's own folder and name first: that is where a user
-    // almost always wants the GIF, and it is the one place we know exists.
-    setOutputDir(defaultOutputDir());
-    setOutputName(defaultOutputName());
-
-    m_start = 0.0;
-    m_end = m_duration;
-    pushSelectionToKernel();
-
+    m_posterTimer.stop();
+    m_estimateTimer.stop();
+    ++m_estimateGeneration;
+    if (m_estimateWorker.joinable()) {
+        gif_cancel(m_core);
+    }
+    m_importing = true;
+    m_importPath = path;
+    m_importStage = 0;
+    m_importWorkerStage.store(0);
+    m_importDone.store(false);
+    m_importOk = false;
+    m_importError.clear();
+    m_importWarning.clear();
     m_lastError.clear();
-    emit mediaChanged();
-    emit selectionChanged();
-    emit filmstripChanged();
+    emit importChanged();
     emit resultChanged();
 
-    refreshPoster();
-    buildFilmstrip(12, 160);
+    const QByteArray input = path.toUtf8();
+    GifCore *candidate = m_importCore;
+    m_importWorker = std::thread([this, candidate, input]() {
+        if (gif_load(candidate, input.constData()) != GIF_OK) {
+            m_importError = QStringLiteral("打开视频失败：%1")
+                                .arg(decodeError(gif_last_error(candidate)));
+            m_importDone.store(true);
+            return;
+        }
+        m_importWorkerStage.store(1);
+        if (gif_update_poster(candidate) != GIF_OK) {
+            m_importWarning = QStringLiteral("预览生成失败，可继续导出 GIF");
+        }
+        m_importWorkerStage.store(2);
+        if (gif_build_filmstrip(candidate, 12, 160) != GIF_OK) {
+            if (!m_importWarning.isEmpty()) {
+                m_importWarning += QStringLiteral("；");
+            }
+            m_importWarning += QStringLiteral("时间轴缩略图生成失败，可继续选择时间并导出");
+        }
+        m_importOk = true;
+        m_importWorkerStage.store(3);
+        m_importDone.store(true);
+    });
+    m_pollTimer.start();
     return true;
+}
+
+QString GifBridge::importFileName() const
+{
+    return QFileInfo(m_importPath).fileName();
+}
+
+QString GifBridge::importPhase() const
+{
+    switch (m_importStage) {
+    case 0: return QStringLiteral("读取视频信息…");
+    case 1: return QStringLiteral("生成预览…");
+    case 2: return QStringLiteral("生成时间轴…");
+    default: return QStringLiteral("导入完成");
+    }
+}
+
+void GifBridge::publishImport()
+{
+    m_importWorker.join();
+    const bool ok = m_importOk;
+    if (ok) {
+        m_importStage = 3;
+        // The old estimate has already stopped; no worker can still use this
+        // handle when it is replaced, and image requests run on the GUI thread.
+        gif_destroy(m_core);
+        m_core = m_importCore;
+        m_importCore = nullptr;
+        m_videoPath = m_importPath;
+        refreshMediaFromKernel();
+        m_start = 0.0;
+        m_end = m_duration;
+        m_filmstripCount = static_cast<int>(gif_filmstrip(m_core).count);
+        ++m_posterRevision;
+        ++m_filmstripRevision;
+        m_hasResult = false;
+        m_lastSummary.clear();
+        m_lastWarning = m_importWarning;
+        m_lastError.clear();
+        clearEstimate();
+        setOutputDir(defaultOutputDir());
+        setOutputName(defaultOutputName());
+        emit mediaChanged();
+        emit selectionChanged();
+        emit posterChanged();
+        emit filmstripChanged();
+    } else {
+        gif_destroy(m_importCore);
+        m_importCore = nullptr;
+        m_lastError = m_importError;
+        emit errorOccurred(m_lastError);
+    }
+    m_importing = false;
+    emit importChanged();
+    emit resultChanged();
+    scheduleEstimate();
+    emit importFinished(ok);
 }
 
 void GifBridge::closeVideo()
 {
-    if (!m_core) {
+    if (!m_core || m_importing || m_exporting || m_startExportWhenIdle) {
         return;
     }
     m_posterTimer.stop();
@@ -682,7 +764,7 @@ double GifBridge::parseTime(const QString &text) const
 
 void GifBridge::refreshPoster()
 {
-    if (!m_core || !m_mediaLoaded) {
+    if (!m_core || !m_mediaLoaded || m_importing) {
         return;
     }
     const gif_status status = gif_update_poster(m_core);
@@ -700,7 +782,7 @@ void GifBridge::onPosterDebounce()
 
 void GifBridge::buildFilmstrip(int count, int thumbWidth)
 {
-    if (!m_core || !m_mediaLoaded) {
+    if (!m_core || !m_mediaLoaded || m_importing) {
         return;
     }
     const int clampedCount = std::clamp(count, 2, 40);
@@ -997,6 +1079,10 @@ void GifBridge::startExport(const QString &outputPath)
         refuse(QStringLiteral("Rust 内核未初始化"));
         return;
     }
+    if (m_importing) {
+        refuse(QStringLiteral("请等待视频导入完成"));
+        return;
+    }
     if (m_exporting) {
         // A real export is already running and will emit when it ends; saying
         // anything here would report a failure that has not happened.
@@ -1158,6 +1244,16 @@ void GifBridge::onPollTick()
     if (m_estimateWorker.joinable() && m_estimateDone.load()) {
         publishEstimate();
     }
+    if (m_importing) {
+        const int stage = m_importWorkerStage.load();
+        if (stage != m_importStage) {
+            m_importStage = stage;
+            emit importChanged();
+        }
+        if (m_importDone.load() && !m_estimateWorker.joinable()) {
+            publishImport();
+        }
+    }
 
     // A queued export is waiting for the estimate that was decoding on the same
     // kernel handle. publishEstimate() starts it, but if that estimate was
@@ -1217,7 +1313,7 @@ void GifBridge::onPollTick()
     // running export (m_exporting), a finished worker whose result has not been
     // published yet, an estimate still decoding, or an export queued behind one.
     if (!m_exporting && !m_worker.joinable() && !m_estimateWorker.joinable()
-        && !m_startExportWhenIdle) {
+        && !m_startExportWhenIdle && !m_importing) {
         m_pollTimer.stop();
     }
 }
@@ -1234,7 +1330,7 @@ void GifBridge::scheduleEstimate()
     }
     // A running export owns the kernel handle; onPollTick re-schedules once it
     // is done. A queued export means the estimate must wait even longer.
-    if (m_exporting || m_startExportWhenIdle) {
+    if (m_exporting || m_startExportWhenIdle || m_importing) {
         return;
     }
     ++m_estimateGeneration;
@@ -1255,7 +1351,7 @@ void GifBridge::refreshEstimate()
         clearEstimate();
         return;
     }
-    if (m_exporting || m_startExportWhenIdle) {
+    if (m_exporting || m_startExportWhenIdle || m_importing) {
         return;
     }
     m_estimateTimer.stop();
@@ -1264,7 +1360,7 @@ void GifBridge::refreshEstimate()
 
 void GifBridge::startEstimate()
 {
-    if (!m_core || !m_mediaLoaded || m_exporting || m_startExportWhenIdle) {
+    if (!m_core || !m_mediaLoaded || m_exporting || m_startExportWhenIdle || m_importing) {
         return;
     }
     if (m_estimateWorker.joinable()) {
