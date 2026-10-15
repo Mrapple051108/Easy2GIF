@@ -674,6 +674,35 @@ pub fn map_frame_dithered_with(
     strength: f64,
     out: &mut Vec<u8>,
 ) {
+    map_frame_dithered_with_scratch(
+        cm,
+        palette,
+        rgb,
+        w,
+        h,
+        strength,
+        out,
+        &mut DitherScratch::default(),
+    )
+}
+
+/// Error rows belong to a worker; every frame starts with zero diffusion error.
+#[derive(Default)]
+pub(crate) struct DitherScratch {
+    rows: [Vec<f32>; 6],
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn map_frame_dithered_with_scratch(
+    cm: &ColorMap,
+    palette: &Palette,
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    strength: f64,
+    out: &mut Vec<u8>,
+    scratch: &mut DitherScratch,
+) {
     let strength = strength.clamp(0.0, 1.0);
     let n = palette.colors.len();
     if n == 0 {
@@ -683,12 +712,12 @@ pub fn map_frame_dithered_with(
     }
 
     // Two-row rolling error buffers.
-    let mut err_r = vec![0f32; w + 2];
-    let mut err_g = vec![0f32; w + 2];
-    let mut err_b = vec![0f32; w + 2];
-    let mut nxt_r = vec![0f32; w + 2];
-    let mut nxt_g = vec![0f32; w + 2];
-    let mut nxt_b = vec![0f32; w + 2];
+    for row in &mut scratch.rows {
+        row.resize(w + 2, 0.0);
+        row.fill(0.0);
+    }
+    let [mut err_r, mut err_g, mut err_b, mut nxt_r, mut nxt_g, mut nxt_b] =
+        scratch.rows.each_mut();
 
     out.clear();
     out.reserve(w * h);

@@ -86,6 +86,14 @@ fn fixtures() -> &'static Fixtures {
         });
         make("odd", 320, 181, 12, &|i, _, _| (i * 16) as u8);
         make("constant", 32, 32, 100, &|_, _, _| 40);
+        make("sparse", 64, 48, 24, &|i, x, y| {
+            let (left, top) = [(0, 0), (60, 0), (60, 44), (0, 44), (30, 20), (0, 0)][i / 4];
+            if (left..left + 4).contains(&x) && (top..top + 4).contains(&y) {
+                200
+            } else {
+                40
+            }
+        });
         run(
             &tools.ffmpeg,
             &[
@@ -260,6 +268,130 @@ fn delays(path: &Path) -> Vec<u16> {
         p += 1;
     }
     delays
+}
+
+fn image_regions(path: &Path) -> Vec<(u16, u16, u16, u16)> {
+    let bytes = std::fs::read(path).unwrap();
+    let mut p = 13;
+    if bytes[10] & 128 != 0 {
+        p += 3 * (1 << ((bytes[10] & 7) + 1));
+    }
+    let mut regions = Vec::new();
+    loop {
+        let tag = bytes[p];
+        p += 1;
+        match tag {
+            0x3b => break,
+            0x21 => {
+                p += 1;
+            }
+            0x2c => {
+                let field = |offset| u16::from_le_bytes([bytes[p + offset], bytes[p + offset + 1]]);
+                regions.push((field(0), field(2), field(4), field(6)));
+                let packed = bytes[p + 8];
+                p += 9;
+                if packed & 128 != 0 {
+                    p += 3 * (1 << ((packed & 7) + 1));
+                }
+                p += 1;
+            }
+            _ => panic!("unexpected GIF block {tag}"),
+        }
+        while bytes[p] != 0 {
+            p += bytes[p] as usize + 1;
+        }
+        p += 1;
+    }
+    regions
+}
+
+#[test]
+fn sparse_rectangles_preserve_pixels_timing_edges_and_loop_restart() {
+    let f = fixtures();
+    let plain = Settings {
+        input: f.dir.join("sparse.mkv"),
+        end: 2.4,
+        max_width: 64,
+        ..settings("sparse-plain")
+    };
+    let full = export(&f.tools, &plain, &Progress::new()).unwrap();
+    let expected = decode(&plain.output);
+    for dedupe in [false, true] {
+        let mut serial = None;
+        for threads in [1, 4] {
+            let s = Settings {
+                output: f.dir.join(format!("sparse-{dedupe}-{threads}.gif")),
+                optimize: true,
+                dedupe,
+                tolerance: 0,
+                max_threads: threads,
+                ..plain.clone()
+            };
+            let actual = export(&f.tools, &s, &Progress::new()).unwrap();
+            assert_eq!(actual.duration, full.duration);
+            assert!(actual.bytes < full.bytes);
+            let regions = image_regions(&s.output);
+            assert_eq!(regions[0], (0, 0, 64, 48));
+            assert!(regions
+                .iter()
+                .skip(1)
+                .any(|&(x, y, w, h)| x > 0 || y > 0 || w < 64 || h < 48));
+            if !dedupe {
+                assert!(regions.contains(&(0, 0, 1, 1)));
+            }
+            let rgb = decode(&s.output);
+            let delays = delays(&s.output);
+            let pixels = 64 * 48 * 3;
+            let mut expanded = Vec::new();
+            for (frame, delay) in rgb.chunks_exact(pixels).zip(&delays) {
+                assert_eq!(delay % 10, 0);
+                for _ in 0..delay / 10 {
+                    expanded.extend_from_slice(frame);
+                }
+            }
+            assert_eq!(expanded, expected);
+            // Decode two actual playback loops; a cropped first frame would leave stale pixels.
+            let loops = Command::new(&f.tools.ffmpeg)
+                .args(["-v", "error", "-ignore_loop", "0", "-i"])
+                .arg(&s.output)
+                .args([
+                    "-frames:v",
+                    &(actual.frames * 2).to_string(),
+                    "-fps_mode",
+                    "passthrough",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgb24",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                loops.status.success(),
+                "{}",
+                String::from_utf8_lossy(&loops.stderr)
+            );
+            assert_eq!(loops.stdout, rgb.repeat(2));
+            let bytes = std::fs::read(&s.output).unwrap();
+            if let Some(serial) = &serial {
+                assert_eq!(&bytes, serial);
+            } else {
+                serial = Some(bytes);
+            }
+        }
+    }
+    let short = Settings {
+        output: f.dir.join("sparse-exact-estimate.gif"),
+        end: 0.8,
+        optimize: true,
+        dedupe: true,
+        ..plain
+    };
+    let estimate = gifcore::export::estimate(&f.tools, &short, &Progress::new()).unwrap();
+    let actual = export(&f.tools, &short, &Progress::new()).unwrap();
+    assert!(estimate.exact);
+    assert_eq!(estimate.bytes, actual.bytes);
 }
 
 #[test]

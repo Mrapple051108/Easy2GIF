@@ -11,10 +11,12 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::error::{Error, Result};
 use crate::ffmpeg::probe::{probe_with_cancel, MediaInfo};
 use crate::ffmpeg::process::{fmt_time, run_ffmpeg_stream_cancel, MediaTools};
-use crate::gif::encode::{frame_block, set_block_delay, Disposal, FrameSpec, GifWriter};
+use crate::gif::encode::{
+    frame_block_into, set_block_delay, Disposal, FrameRegion, FrameSpec, GifWriter, LzwScratch,
+};
 use crate::gif::quantize::{
-    map_frame_dithered_with, map_frame_ordered_with, map_frame_with, posterize_in_place,
-    posterize_levels, quantize_cancellable, quantize_iterations, ColorMap, Palette,
+    map_frame_dithered_with_scratch, map_frame_ordered_with, map_frame_with, posterize_in_place,
+    posterize_levels, quantize_cancellable, quantize_iterations, ColorMap, DitherScratch, Palette,
 };
 use crate::gif::Dither;
 
@@ -248,23 +250,48 @@ fn apply_transparency(
     palette: &Palette,
     tolerance: u32,
     transparent: u8,
-) -> bool {
+    width: u32,
+    height: u32,
+) -> Option<FrameRegion> {
     if canvas.len() != indices.len() {
-        *canvas = indices.to_vec();
-        return false;
+        canvas.clear();
+        canvas.extend_from_slice(indices);
+        return Some(FrameRegion::full(width as u16, height as u16));
     }
-    let mut unchanged = true;
-    for (current, retained) in indices.iter_mut().zip(canvas.iter_mut()) {
-        let a = palette.colors[*current as usize];
-        let b = palette.colors[*retained as usize];
-        if (0..3).all(|c| a[c].abs_diff(b[c]) as u32 <= tolerance) {
-            *current = transparent;
-        } else {
-            *retained = *current;
-            unchanged = false;
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for (y, (row, retained_row)) in indices
+        .chunks_exact_mut(width as usize)
+        .zip(canvas.chunks_exact_mut(width as usize))
+        .enumerate()
+    {
+        let (mut first, mut last) = (width, 0);
+        for (x, (current, retained)) in row.iter_mut().zip(retained_row).enumerate() {
+            let unchanged = *current == *retained || {
+                let a = palette.colors[*current as usize];
+                let b = palette.colors[*retained as usize];
+                (0..3).all(|c| a[c].abs_diff(b[c]) as u32 <= tolerance)
+            };
+            if unchanged {
+                *current = transparent;
+            } else {
+                *retained = *current;
+                first = first.min(x as u32);
+                last = x as u32 + 1;
+            }
+        }
+        if last > 0 {
+            left = left.min(first);
+            right = right.max(last);
+            top = top.min(y as u32);
+            bottom = y as u32 + 1;
         }
     }
-    unchanged
+    (bottom != 0).then(|| FrameRegion {
+        left: left as u16,
+        top: top as u16,
+        width: (right - left) as u16,
+        height: (bottom - top) as u16,
+    })
 }
 
 /// How many logical CPUs this machine reports, read at run time.
@@ -595,7 +622,7 @@ impl RawReader {
     /// Load the next whole frame; `Ok(false)` at a clean end of data.
     fn next(&mut self, buf: &mut Vec<u8>) -> Result<bool> {
         use std::io::Read;
-        buf.clear();
+        // Reused frames already have the right length; read overwrites every byte.
         buf.resize(self.cap, 0);
         let mut got = 0usize;
         while got < self.cap {
@@ -1254,19 +1281,229 @@ struct EncodingStats {
     uniform: bool,
 }
 
-fn flush_pending<W: std::io::Write>(
-    writer: &mut GifWriter<W>,
-    pending: &mut Option<Vec<u8>>,
-    pending_delay: &mut u32,
-    written: &mut u64,
-) -> Result<()> {
-    if let Some(mut block) = pending.take() {
-        set_block_delay(&mut block, *pending_delay as u16);
-        writer.add_block(&block)?;
-        *written += 1;
-        *pending_delay = 0;
+#[derive(Default)]
+struct PendingFrame {
+    block: Vec<u8>,
+    delay: u32,
+    active: bool,
+}
+
+impl PendingFrame {
+    fn flush<W: std::io::Write>(
+        &mut self,
+        writer: &mut GifWriter<W>,
+        written: &mut u64,
+    ) -> Result<()> {
+        if self.active {
+            set_block_delay(&mut self.block, self.delay as u16);
+            writer.add_block(&self.block)?;
+            *written += 1;
+            self.block.clear();
+            self.delay = 0;
+            self.active = false;
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[derive(Default)]
+struct FrameWork {
+    rgb: Vec<u8>,
+    indices: Vec<u8>,
+    block: Vec<u8>,
+    region: Option<FrameRegion>,
+    key: bool,
+    equal: bool,
+}
+
+#[derive(Default)]
+struct WorkerScratch {
+    dither: DitherScratch,
+    lzw: LzwScratch,
+}
+
+#[derive(Clone, Copy)]
+struct FrameContext<'a> {
+    settings: &'a Settings,
+    palette: &'a Palette,
+    gif_palette: &'a Palette,
+    colour_map: &'a ColorMap,
+    opts: FrameOptions,
+    w: u32,
+    h: u32,
+}
+
+#[derive(Clone, Copy)]
+enum WorkStage {
+    Map,
+    Compress,
+}
+
+impl FrameContext<'_> {
+    fn process(
+        &self,
+        work: &mut FrameWork,
+        stage: WorkStage,
+        scratch: &mut WorkerScratch,
+    ) -> Result<()> {
+        check_cancel(self.settings)?;
+        match stage {
+            WorkStage::Map => {
+                if self.opts.posterize_levels >= 2 {
+                    posterize_in_place(&mut work.rgb, self.opts.posterize_levels);
+                }
+                match self.opts.dither {
+                    Dither::None => map_frame_with(self.colour_map, &work.rgb, &mut work.indices),
+                    Dither::Ordered => map_frame_ordered_with(
+                        self.colour_map,
+                        &work.rgb,
+                        self.w as usize,
+                        self.opts.strength,
+                        &mut work.indices,
+                    ),
+                    Dither::Floyd => map_frame_dithered_with_scratch(
+                        self.colour_map,
+                        self.palette,
+                        &work.rgb,
+                        self.w as usize,
+                        self.h as usize,
+                        self.opts.strength,
+                        &mut work.indices,
+                        &mut scratch.dither,
+                    ),
+                }
+                Ok(())
+            }
+            WorkStage::Compress => {
+                if let Some(region) = work.region {
+                    frame_block_into(
+                        &FrameSpec {
+                            width: self.w as u16,
+                            height: self.h as u16,
+                            indices: &work.indices,
+                            palette: self.gif_palette,
+                            local_table: false,
+                            delay_cs: 0,
+                            disposal: Disposal::DoNotDispose,
+                            transparent: self.opts.transparent,
+                        },
+                        region,
+                        &mut scratch.lzw,
+                        &mut work.block,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+struct FrameTask {
+    index: usize,
+    work: FrameWork,
+    stage: WorkStage,
+}
+
+/// Workers live for one encoding pass. Queues and the owning batch bound in-flight memory.
+struct FrameWorkers<'a> {
+    senders: Vec<std::sync::mpsc::SyncSender<FrameTask>>,
+    results: std::sync::mpsc::Receiver<Result<(usize, FrameWork)>>,
+    context: FrameContext<'a>,
+    local: WorkerScratch,
+    selected: Vec<usize>,
+}
+
+impl<'a> FrameWorkers<'a> {
+    fn new<'scope>(
+        scope: &'scope std::thread::Scope<'scope, 'a>,
+        context: FrameContext<'a>,
+        count: usize,
+    ) -> Result<Self>
+    where
+        'a: 'scope,
+    {
+        let (result_tx, results) = std::sync::mpsc::channel();
+        let mut senders = Vec::new();
+        if count > 1 {
+            for _ in 0..count {
+                let (tx, rx) = std::sync::mpsc::sync_channel::<FrameTask>(1);
+                let completed = result_tx.clone();
+                std::thread::Builder::new()
+                    .name("gif-encode".into())
+                    .spawn_scoped(scope, move || {
+                        let mut scratch = WorkerScratch::default();
+                        while let Ok(mut task) = rx.recv() {
+                            let result =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    context.process(&mut task.work, task.stage, &mut scratch)
+                                }))
+                                .unwrap_or_else(|_| {
+                                    Err(Error::Encode("encoding worker panicked".into()))
+                                });
+                            if completed
+                                .send(result.map(|_| (task.index, task.work)))
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    })
+                    .map_err(|e| Error::Encode(format!("cannot start encoding worker: {e}")))?;
+                senders.push(tx);
+            }
+        }
+        Ok(Self {
+            senders,
+            results,
+            context,
+            local: WorkerScratch::default(),
+            selected: Vec::new(),
+        })
+    }
+
+    fn run(&mut self, frames: &mut [FrameWork], stage: WorkStage) -> Result<()> {
+        self.selected.clear();
+        self.selected.extend(
+            (0..frames.len())
+                .filter(|&i| matches!(stage, WorkStage::Map) || frames[i].region.is_some()),
+        );
+        if self.senders.is_empty() || self.selected.len() <= 1 {
+            for &i in &self.selected {
+                self.context
+                    .process(&mut frames[i], stage, &mut self.local)?;
+            }
+            return Ok(());
+        }
+        for (n, &i) in self.selected.iter().enumerate() {
+            self.senders[n % self.senders.len()]
+                .send(FrameTask {
+                    index: i,
+                    work: std::mem::take(&mut frames[i]),
+                    stage,
+                })
+                .map_err(|_| Error::Encode("encoding worker stopped".into()))?;
+        }
+        let mut error = None;
+        // Drain every result before returning; a failed frame must not leave stale work queued.
+        for _ in 0..self.selected.len() {
+            match self
+                .results
+                .recv()
+                .map_err(|_| Error::Encode("encoding workers stopped".into()))?
+            {
+                Ok((index, work)) => frames[index] = work,
+                Err(e) => {
+                    if error.is_none() {
+                        error = Some(e);
+                    }
+                }
+            }
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Index in parallel, update the retained canvas in order, then compress in parallel.
@@ -1300,168 +1537,145 @@ fn stream_frames<W: std::io::Write>(
     )?;
     let mut reader = RawReader::open(raw_path, frame_bytes)?;
     let batch = (threads as usize * 2).clamp(1, ((24 << 20) / (frame_bytes * 3).max(1)).max(1));
-    let mut stats = EncodingStats {
-        uniform: true,
-        ..Default::default()
-    };
-    let mut reference: Option<Vec<u8>> = None;
-    let mut pending = None;
-    let mut pending_delay = 0u32;
-    let mut canvas = Vec::new();
-    let mut previous = Vec::new();
-    let mut read = 0u64;
-    let mut segment = 0usize;
-    let mut segment_end = segments.first().copied().unwrap_or(frame_count);
-    let total_cs = timeline_cs(settings, frame_count);
-    while read < frame_count {
-        check_cancel(settings)?;
-        if read == segment_end {
-            flush_pending(
-                &mut writer,
-                &mut pending,
-                &mut pending_delay,
-                &mut stats.written,
-            )?;
-            canvas.clear();
-            previous.clear();
-            segment += 1;
-            segment_end += segments.get(segment).copied().unwrap_or(frame_count - read);
-        }
-        let count = ((segment_end - read).min(frame_count - read) as usize).min(batch);
-        if count == 0 {
-            return Err(Error::BadMedia("empty decoded segment".into()));
-        }
-        let mut pixels = Vec::with_capacity(count);
-        for _ in 0..count {
-            let mut px = Vec::new();
-            if !reader.next(&mut px)? {
-                return Err(Error::BadMedia("raw frame count changed".into()));
-            }
-            pixels.push(px);
-        }
-        let mut mapped = vec![Vec::new(); count];
-        parallel_each(&pixels, &mut mapped, threads, |px, out| {
-            check_cancel(settings)?;
-            *out = map_pixels(colour_map, palette, px, w as usize, h as usize, &opts);
-            Ok(())
-        })?;
-        drop(pixels);
-        let mut keys = Vec::with_capacity(count);
-        let mut equal = Vec::with_capacity(count);
-        for indices in &mut mapped {
-            check_cancel(settings)?;
-            let key = previous.is_empty();
-            if let Some(reference) = &reference {
-                stats.uniform &= reference == indices;
-            } else {
-                reference = Some(indices.clone());
-            }
-            let same = if let Some(index) = opts.transparent {
-                apply_transparency(indices, &mut canvas, palette, opts.tolerance, index)
-            } else {
-                !key && *indices == previous
-            };
-            if opts.transparent.is_none() {
-                previous.clone_from(indices);
-            } else if key {
-                previous.push(0);
-            } // only the first-frame marker is needed
-            keys.push(key);
-            equal.push(same);
-        }
-        let mut blocks = vec![Vec::new(); count];
-        parallel_each(&mapped, &mut blocks, threads, |indices, out| {
-            check_cancel(settings)?;
-            *out = frame_block(&FrameSpec {
-                width: w as u16,
-                height: h as u16,
-                indices,
-                palette: gif_palette,
-                local_table: false,
-                delay_cs: 0,
-                disposal: Disposal::DoNotDispose,
-                transparent: opts.transparent,
-            })?;
-            Ok(())
-        })?;
-        for (i, block) in blocks.into_iter().enumerate() {
-            check_cancel(settings)?;
-            let delay = delay_at(total_cs, frame_count, read) as u32;
-            stats.total_cs += delay as u64;
-            if keys[i] {
-                stats.key_bytes += block.len() as u64;
-                stats.segments += 1;
-            } else {
-                stats.transitions += 1;
-                if !equal[i] {
-                    stats.changes += 1;
-                }
-                if !opts.dedupe || !equal[i] {
-                    stats.delta_bytes += block.len() as u64;
-                }
-            }
-            if opts.dedupe
-                && equal[i]
-                && pending.is_some()
-                && pending_delay + delay <= u16::MAX as u32
-            {
-                pending_delay += delay;
-            } else {
-                flush_pending(
-                    &mut writer,
-                    &mut pending,
-                    &mut pending_delay,
-                    &mut stats.written,
-                )?;
-                pending = Some(block);
-                pending_delay = delay;
-            }
-            read += 1;
-            progress.step();
-        }
-    }
-    check_cancel(settings)?;
-    flush_pending(
-        &mut writer,
-        &mut pending,
-        &mut pending_delay,
-        &mut stats.written,
-    )?;
-    Ok((writer.finish()?, stats))
-}
-
-fn parallel_each<F>(input: &[Vec<u8>], output: &mut [Vec<u8>], threads: u32, f: F) -> Result<()>
-where
-    F: Fn(&[u8], &mut Vec<u8>) -> Result<()> + Sync,
-{
-    let workers = (threads as usize).max(1).min(input.len().max(1));
-    if workers == 1 {
-        for (src, dst) in input.iter().zip(output) {
-            f(src, dst)?;
-        }
-        return Ok(());
-    }
-    let chunk = input.len().div_ceil(workers).max(1);
     std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (src, dst) in input.chunks(chunk).zip(output.chunks_mut(chunk)) {
-            let f = &f;
-            handles.push(scope.spawn(move || -> Result<()> {
-                for (src, dst) in src.iter().zip(dst) {
-                    f(src, dst)?;
+        let context = FrameContext {
+            settings,
+            palette,
+            gif_palette,
+            colour_map,
+            opts,
+            w,
+            h,
+        };
+        let mut workers = FrameWorkers::new(
+            scope,
+            context,
+            (threads as usize)
+                .max(1)
+                .min(batch)
+                .min(frame_count as usize),
+        )?;
+        let mut work: Vec<FrameWork> = (0..batch.min(frame_count as usize))
+            .map(|_| FrameWork::default())
+            .collect();
+        let mut stats = EncodingStats {
+            uniform: true,
+            ..Default::default()
+        };
+        let mut reference: Option<Vec<u8>> = None;
+        let mut pending = PendingFrame::default();
+        let mut canvas = Vec::new();
+        let mut previous = Vec::new();
+        let mut read = 0u64;
+        let mut segment = 0usize;
+        let mut segment_end = segments.first().copied().unwrap_or(frame_count);
+        let total_cs = timeline_cs(settings, frame_count);
+        while read < frame_count {
+            check_cancel(settings)?;
+            if read == segment_end {
+                pending.flush(&mut writer, &mut stats.written)?;
+                canvas.clear();
+                previous.clear();
+                segment += 1;
+                segment_end += segments.get(segment).copied().unwrap_or(frame_count - read);
+            }
+            let count = ((segment_end - read).min(frame_count - read) as usize).min(batch);
+            if count == 0 {
+                return Err(Error::BadMedia("empty decoded segment".into()));
+            }
+            let frames = &mut work[..count];
+            for frame in frames.iter_mut() {
+                if !reader.next(&mut frame.rgb)? {
+                    return Err(Error::BadMedia("raw frame count changed".into()));
                 }
-                Ok(())
-            }));
+            }
+            workers.run(frames, WorkStage::Map)?;
+            let mut planned_delay = pending.delay;
+            let mut planned_pending = pending.active;
+            for (i, frame) in frames.iter_mut().enumerate() {
+                check_cancel(settings)?;
+                frame.key = previous.is_empty();
+                if let Some(reference) = &reference {
+                    stats.uniform &= reference == &frame.indices;
+                } else {
+                    reference = Some(frame.indices.clone());
+                }
+                let region = if let Some(index) = opts.transparent {
+                    apply_transparency(
+                        &mut frame.indices,
+                        &mut canvas,
+                        palette,
+                        opts.tolerance,
+                        index,
+                        w,
+                        h,
+                    )
+                } else if !frame.key && frame.indices == previous {
+                    None
+                } else {
+                    Some(FrameRegion::full(w as u16, h as u16))
+                };
+                frame.equal = region.is_none();
+                if opts.transparent.is_none() {
+                    previous.clone_from(&frame.indices);
+                } else if frame.key {
+                    previous.push(0);
+                }
+                let delay = delay_at(total_cs, frame_count, read + i as u64) as u32;
+                if opts.dedupe
+                    && frame.equal
+                    && planned_pending
+                    && planned_delay + delay <= u16::MAX as u32
+                {
+                    frame.region = None;
+                    planned_delay += delay;
+                } else {
+                    frame.region = Some(if frame.key || opts.transparent.is_none() {
+                        FrameRegion::full(w as u16, h as u16)
+                    } else {
+                        // No-change frames still carry time when dedupe is off or the delay is full.
+                        region.unwrap_or(FrameRegion::full(1, 1))
+                    });
+                    planned_delay = delay;
+                    planned_pending = true;
+                }
+            }
+            workers.run(frames, WorkStage::Compress)?;
+            for frame in frames {
+                check_cancel(settings)?;
+                let delay = delay_at(total_cs, frame_count, read) as u32;
+                stats.total_cs += delay as u64;
+                if frame.key {
+                    stats.key_bytes += frame.block.len() as u64;
+                    stats.segments += 1;
+                } else {
+                    stats.transitions += 1;
+                    if !frame.equal {
+                        stats.changes += 1;
+                    }
+                    if !opts.dedupe || !frame.equal {
+                        stats.delta_bytes += frame.block.len() as u64;
+                    }
+                }
+                if frame.region.is_none() {
+                    pending.delay += delay;
+                } else {
+                    pending.flush(&mut writer, &mut stats.written)?;
+                    std::mem::swap(&mut pending.block, &mut frame.block);
+                    pending.delay = delay;
+                    pending.active = true;
+                }
+                read += 1;
+                progress.step();
+            }
         }
-        for handle in handles {
-            handle
-                .join()
-                .map_err(|_| Error::Encode("encoding worker panicked".into()))??;
-        }
-        Ok(())
+        check_cancel(settings)?;
+        pending.flush(&mut writer, &mut stats.written)?;
+        Ok((writer.finish()?, stats))
     })
 }
 
+#[cfg(test)]
 fn map_pixels(
     colour_map: &ColorMap,
     palette: &Palette,
@@ -1470,32 +1684,24 @@ fn map_pixels(
     h: usize,
     opts: &FrameOptions,
 ) -> Vec<u8> {
-    let processed;
-    let source = if opts.posterize_levels >= 2 {
-        let mut copy = px.to_vec();
-        posterize_in_place(&mut copy, opts.posterize_levels);
-        processed = copy;
-        processed.as_slice()
-    } else {
-        px
+    let settings = Settings::default();
+    let context = FrameContext {
+        settings: &settings,
+        palette,
+        gif_palette: palette,
+        colour_map,
+        opts: *opts,
+        w: w as u32,
+        h: h as u32,
     };
-    let mut indices = Vec::with_capacity(w * h);
-    match opts.dither {
-        Dither::None => map_frame_with(colour_map, source, &mut indices),
-        Dither::Ordered => {
-            map_frame_ordered_with(colour_map, source, w, opts.strength, &mut indices)
-        }
-        Dither::Floyd => map_frame_dithered_with(
-            colour_map,
-            palette,
-            &source,
-            w,
-            h,
-            opts.strength,
-            &mut indices,
-        ),
-    }
-    indices
+    let mut work = FrameWork {
+        rgb: px.to_vec(),
+        ..Default::default()
+    };
+    context
+        .process(&mut work, WorkStage::Map, &mut WorkerScratch::default())
+        .unwrap();
+    work.indices
 }
 
 /// Sample frames spread over the selection and quantise the union of them.
@@ -1728,26 +1934,64 @@ mod tests {
                 tolerance: 0,
                 dedupe: false,
             };
-            let mut serial: Vec<Vec<u8>> = vec![Vec::new(); frames.len()];
-            parallel_each(&frames, &mut serial, 1, |px, out| {
-                *out = map_pixels(&cm, &palette, px, w, h, &opts);
-                Ok(())
-            })?;
-
-            for threads in [2u32, 3, 4, 8, 16] {
-                let mut got: Vec<Vec<u8>> = vec![Vec::new(); frames.len()];
-                parallel_each(&frames, &mut got, threads, |px, out| {
-                    *out = map_pixels(&cm, &palette, px, w, h, &opts);
+            let serial: Vec<Vec<u8>> = frames
+                .iter()
+                .map(|px| map_pixels(&cm, &palette, px, w, h, &opts))
+                .collect();
+            let settings = Settings::default();
+            let context = FrameContext {
+                settings: &settings,
+                palette: &palette,
+                gif_palette: &palette,
+                colour_map: &cm,
+                opts,
+                w: w as u32,
+                h: h as u32,
+            };
+            for threads in [1usize, 2, 3, 4, 8, 16] {
+                std::thread::scope(|scope| -> Result<()> {
+                    let mut workers = FrameWorkers::new(scope, context, threads)?;
+                    let mut work: Vec<_> = frames
+                        .iter()
+                        .map(|rgb| FrameWork {
+                            rgb: rgb.clone(),
+                            ..Default::default()
+                        })
+                        .collect();
+                    for _ in 0..3 {
+                        workers.run(&mut work, WorkStage::Map)?;
+                        for (frame, expected) in work.iter().zip(&serial) {
+                            assert_eq!(
+                                &frame.indices, expected,
+                                "{dither:?} with {threads} workers"
+                            );
+                        }
+                    }
+                    // Drain failures and reuse the same queues without publishing an old result.
+                    for frame in &mut work {
+                        frame.region = Some(FrameRegion::full(0, 0));
+                    }
+                    assert!(workers.run(&mut work, WorkStage::Compress).is_err());
+                    for (i, frame) in work.iter_mut().enumerate() {
+                        frame.indices.clone_from(&serial[i]);
+                        frame.region = Some(FrameRegion::full(w as u16, h as u16));
+                    }
+                    workers.run(&mut work, WorkStage::Compress)?;
+                    for (frame, indices) in work.iter().zip(&serial) {
+                        let isolated = crate::gif::encode::frame_block(&FrameSpec {
+                            width: w as u16,
+                            height: h as u16,
+                            indices,
+                            palette: &palette,
+                            local_table: false,
+                            delay_cs: 0,
+                            disposal: Disposal::DoNotDispose,
+                            transparent: None,
+                        })?;
+                        assert_eq!(frame.block, isolated, "reused LZW state changed the block");
+                    }
                     Ok(())
                 })?;
-                assert_eq!(
-                    got, serial,
-                    "{dither:?} with {threads} threads diverged from the serial result"
-                );
-            }
-
-            for b in &serial {
-                assert!(!b.is_empty(), "an empty frame block was produced");
             }
         }
         Ok(())
@@ -1892,29 +2136,127 @@ mod tests {
             colors: vec![[0, 0, 0]],
         };
         let map = ColorMap::build(&palette);
-        let settings = Settings {
-            end: 7000.0,
-            fps: 0.1,
-            dedupe: true,
-            ..Settings::default()
+        for optimize in [false, true] {
+            let gif_palette = if optimize {
+                palette.with_reserved_slot()
+            } else {
+                palette.clone()
+            };
+            for threads in [1, 4] {
+                let settings = Settings {
+                    end: 7000.0,
+                    fps: 0.1,
+                    dedupe: true,
+                    optimize,
+                    ..Settings::default()
+                };
+                let (_, stats) = stream_frames(
+                    CountingSink::default(),
+                    &settings,
+                    temp.path(),
+                    &palette,
+                    &gif_palette,
+                    &map,
+                    2,
+                    2,
+                    700,
+                    threads,
+                    12,
+                    &[700],
+                    &Progress::new(),
+                )?;
+                assert_eq!(stats.total_cs, 700000);
+                assert_eq!(stats.written, 11);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "manual encoding benchmark; run in release with --ignored --nocapture"]
+    fn encoding_workload_benchmark() -> Result<()> {
+        let palette = Palette {
+            colors: (0..=254).map(|v| [v, v, v]).collect(),
         };
-        let (_, stats) = stream_frames(
-            CountingSink::default(),
-            &settings,
-            temp.path(),
-            &palette,
-            &palette,
-            &map,
-            2,
-            2,
-            700,
-            1,
-            12,
-            &[700],
-            &Progress::new(),
-        )?;
-        assert_eq!(stats.total_cs, 700000);
-        assert_eq!(stats.written, 11);
+        let map = ColorMap::build(&palette);
+        for (name, w, h, frames, optimize, dedupe) in [
+            ("small", 48, 48, 600, false, false),
+            ("static", 640, 360, 120, true, true),
+            ("local", 640, 360, 120, true, false),
+            ("motion", 640, 360, 120, false, false),
+        ] {
+            let temp = crate::ffmpeg::process::TempFile::new("encoding-bench")?;
+            let mut raw = BufWriter::new(std::fs::File::create(temp.path())?);
+            use std::io::Write;
+            for n in 0..frames as usize {
+                let mut rgb = vec![40u8; w * h * 3];
+                for y in 0..h {
+                    for x in 0..w {
+                        let v = match name {
+                            "static" => 40,
+                            "local" => {
+                                if x >= n * 3 % (w - 24)
+                                    && x < n * 3 % (w - 24) + 24
+                                    && y >= h / 2
+                                    && y < h / 2 + 24
+                                {
+                                    200
+                                } else {
+                                    40
+                                }
+                            }
+                            _ => ((x * 17 + y * 31 + n * 19) % 255) as u8,
+                        };
+                        rgb[(y * w + x) * 3..(y * w + x) * 3 + 3].fill(v);
+                    }
+                }
+                raw.write_all(&rgb)?;
+            }
+            raw.flush()?;
+            drop(raw);
+            let gif_palette = if optimize {
+                palette.with_reserved_slot()
+            } else {
+                palette.clone()
+            };
+            for threads in [1, 4] {
+                let settings = Settings {
+                    end: frames as f64 / 30.0,
+                    fps: 30.0,
+                    dither: Dither::None,
+                    optimize,
+                    dedupe,
+                    ..Settings::default()
+                };
+                let mut times = Vec::new();
+                let mut bytes = 0;
+                for _ in 0..3 {
+                    let start = std::time::Instant::now();
+                    let (sink, _) = stream_frames(
+                        CountingSink::default(),
+                        &settings,
+                        temp.path(),
+                        &palette,
+                        &gif_palette,
+                        &map,
+                        w as u32,
+                        h as u32,
+                        frames,
+                        threads,
+                        w * h * 3,
+                        &[frames],
+                        &Progress::new(),
+                    )?;
+                    times.push(start.elapsed().as_secs_f64() * 1000.0);
+                    bytes = sink.bytes;
+                }
+                times.sort_by(f64::total_cmp);
+                eprintln!(
+                    "BENCH {name} threads={threads} median_ms={:.3} bytes={bytes}",
+                    times[1]
+                );
+            }
+        }
         Ok(())
     }
 }

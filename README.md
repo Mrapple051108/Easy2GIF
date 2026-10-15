@@ -105,6 +105,10 @@ ffmpeg 这种第三方解码器**核对帧数与字节数。
 - ABI 7 中 `dither_strength=0` 明确关闭抖动。Rust `Default` 和 `NULL` options 仍使用 100；C 调用方应显式设置 100 以选用默认强度。需同时重建内核与前端。
 - `cargo test --offline` 会生成新回归测试所需的视频，必须能运行 FFmpeg、FFprobe 和 rustc；工具缺失会报失败。性能基准单独用 `cargo test --release --offline threading_speeds_up_a_large_export -- --ignored --nocapture` 运行。
 
+本轮进一步复用编码线程、RGB/索引/抖动/LZW 缓冲，在压缩前跳过重复帧，透明优化只编码最小变化矩形。
+显示结果与时序保持一致，ABI 仍为 7；开启透明优化时输出字节会变化。实测数据、复现命令与剩余工作见
+[内核性能优化记录](docs/kernel-optimization.md)。
+
 ## 构建
 
 ### 在 CLion 里直接点 Run

@@ -147,9 +147,54 @@ impl<W: Write> GifWriter<W> {
 /// compress frames on worker threads: the expensive part of a frame is the
 /// palette mapping plus the LZW pass, and neither touches the output stream.
 pub fn frame_block(f: &FrameSpec<'_>) -> Result<Vec<u8>> {
-    validate_frame(f)?;
+    let mut out = Vec::new();
+    frame_block_into(
+        f,
+        FrameRegion::full(f.width, f.height),
+        &mut LzwScratch::default(),
+        &mut out,
+    )?;
+    Ok(out)
+}
 
-    let mut out: Vec<u8> = Vec::with_capacity(f.indices.len() / 2 + 64);
+/// A nonempty rectangle within a full, mapped canvas.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FrameRegion {
+    pub left: u16,
+    pub top: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl FrameRegion {
+    pub fn full(width: u16, height: u16) -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            width,
+            height,
+        }
+    }
+}
+
+/// Reuse the block and dictionary allocations; read rectangle rows without a packed copy.
+pub(crate) fn frame_block_into(
+    f: &FrameSpec<'_>,
+    region: FrameRegion,
+    scratch: &mut LzwScratch,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    validate_frame(f)?;
+    if region.width == 0
+        || region.height == 0
+        || region.left as u32 + region.width as u32 > f.width as u32
+        || region.top as u32 + region.height as u32 > f.height as u32
+    {
+        return Err(Error::Encode(
+            "GIF frame rectangle lies outside the canvas".into(),
+        ));
+    }
+    out.clear();
 
     // Graphic control extension.
     let mut packed = ((f.disposal as u8) & 0x07) << 2;
@@ -164,10 +209,10 @@ pub fn frame_block(f: &FrameSpec<'_>) -> Result<Vec<u8>> {
 
     // Image descriptor.
     out.extend_from_slice(&[0x2C]);
-    out.extend_from_slice(&0u16.to_le_bytes()); // left
-    out.extend_from_slice(&0u16.to_le_bytes()); // top
-    out.extend_from_slice(&f.width.to_le_bytes());
-    out.extend_from_slice(&f.height.to_le_bytes());
+    out.extend_from_slice(&region.left.to_le_bytes());
+    out.extend_from_slice(&region.top.to_le_bytes());
+    out.extend_from_slice(&region.width.to_le_bytes());
+    out.extend_from_slice(&region.height.to_le_bytes());
 
     let table_bits = f.palette.table_bits();
     if f.local_table {
@@ -181,11 +226,25 @@ pub fn frame_block(f: &FrameSpec<'_>) -> Result<Vec<u8>> {
     // when the colour table itself only needs one bit (a 2-entry table).
     let lzw_bits = table_bits.max(2);
     out.push(lzw_bits);
-    let compressed = lzw_compress(f.indices, lzw_bits)?;
-    write_sub_blocks(&mut out, &compressed)?;
+    let rows = f
+        .indices
+        .chunks_exact(f.width as usize)
+        .skip(region.top as usize)
+        .take(region.height as usize);
+    let indices = rows.flat_map(|row| {
+        row[region.left as usize..region.left as usize + region.width as usize]
+            .iter()
+            .copied()
+    });
+    let compressed = scratch.compress(
+        indices,
+        region.width as usize * region.height as usize,
+        lzw_bits,
+    )?;
+    write_sub_blocks(out, compressed)?;
     out.push(0x00); // block terminator
 
-    Ok(out)
+    Ok(())
 }
 
 /// Rewrite the delay field of an already-built frame block.
@@ -273,10 +332,17 @@ impl BitWriter {
         }
     }
 
-    fn finish(mut self) -> Vec<u8> {
+    fn flush(&mut self) {
         if self.nbits > 0 {
             self.out.push((self.acc & 0xFF) as u8);
         }
+        self.acc = 0;
+        self.nbits = 0;
+    }
+
+    #[cfg(test)]
+    fn finish(mut self) -> Vec<u8> {
+        self.flush();
         self.out
     }
 }
@@ -286,91 +352,129 @@ impl BitWriter {
 /// `min_code_size` is the palette's table bit count; indices must all be below
 /// `1 << min_code_size`.
 pub fn lzw_compress(indices: &[u8], min_code_size: u8) -> Result<Vec<u8>> {
-    if !(2..=8).contains(&min_code_size) {
-        return Err(Error::Encode(format!(
-            "invalid LZW minimum code size {min_code_size}"
-        )));
+    let mut scratch = LzwScratch::default();
+    scratch.compress(indices.iter().copied(), indices.len(), min_code_size)?;
+    Ok(scratch.bits.out)
+}
+
+/// One dictionary and bit buffer per worker, reset before every frame.
+pub(crate) struct LzwScratch {
+    keys: Vec<u32>,
+    vals: Vec<u16>,
+    bits: BitWriter,
+}
+
+impl Default for LzwScratch {
+    fn default() -> Self {
+        Self {
+            keys: Vec::new(),
+            vals: Vec::new(),
+            bits: BitWriter::new(0),
+        }
     }
+}
 
-    let clear: u16 = 1u16 << min_code_size;
-    let eoi: u16 = clear + 1;
-    let max_code: u16 = 4095;
-
-    // Dictionary: (prefix code, byte) → code. A flat table keyed by
-    // prefix*256 + byte is exact and fast up to 4096 entries, so use a small
-    // open-addressing map instead of a hash map to stay allocation-light.
-    const TABLE_SIZE: usize = 8192;
-    let mut keys = vec![u32::MAX; TABLE_SIZE];
-    let mut vals = vec![0u16; TABLE_SIZE];
-    let mask = TABLE_SIZE - 1;
-
-    let mut w = BitWriter::new(indices.len() / 2 + 16);
-    let mut width = min_code_size + 1;
-    let mut next_code = eoi + 1;
-
-    w.push(clear, width);
-
-    let mut cur: u16 = 0;
-    let mut have_cur = false;
-
-    for &px in indices {
-        if (px as u16) >= clear {
+impl LzwScratch {
+    fn compress(
+        &mut self,
+        indices: impl Iterator<Item = u8>,
+        pixels: usize,
+        min_code_size: u8,
+    ) -> Result<&[u8]> {
+        if !(2..=8).contains(&min_code_size) {
             return Err(Error::Encode(format!(
-                "colour index {px} does not fit in {} bits",
-                min_code_size
+                "invalid LZW minimum code size {min_code_size}"
             )));
         }
-        let c = px as u16;
-        if !have_cur {
+
+        let clear: u16 = 1u16 << min_code_size;
+        let eoi: u16 = clear + 1;
+        let max_code: u16 = 4095;
+
+        // Dictionary: (prefix code, byte) → code. A flat table keyed by
+        // prefix*256 + byte is exact and fast up to 4096 entries, so use a small
+        // open-addressing map instead of a hash map to stay allocation-light.
+        const TABLE_SIZE: usize = 8192;
+        self.keys.resize(TABLE_SIZE, u32::MAX);
+        self.keys.fill(u32::MAX);
+        self.vals.resize(TABLE_SIZE, 0);
+        let keys = &mut self.keys;
+        let vals = &mut self.vals;
+        let mask = TABLE_SIZE - 1;
+
+        let w = &mut self.bits;
+        w.out.clear();
+        w.out.reserve(pixels / 2 + 16);
+        w.acc = 0;
+        w.nbits = 0;
+        let mut width = min_code_size + 1;
+        let mut next_code = eoi + 1;
+
+        w.push(clear, width);
+
+        let mut cur: u16 = 0;
+        let mut have_cur = false;
+
+        for px in indices {
+            if (px as u16) >= clear {
+                return Err(Error::Encode(format!(
+                    "colour index {px} does not fit in {} bits",
+                    min_code_size
+                )));
+            }
+            let c = px as u16;
+            if !have_cur {
+                cur = c;
+                have_cur = true;
+                continue;
+            }
+
+            let key = ((cur as u32) << 8) | c as u32;
+            let mut slot = (key.wrapping_mul(2654435761) as usize) & mask;
+            let found = loop {
+                match keys[slot] {
+                    u32::MAX => break None,
+                    k if k == key => break Some(vals[slot]),
+                    _ => slot = (slot + 1) & mask,
+                }
+            };
+
+            if let Some(code) = found {
+                cur = code;
+                continue;
+            }
+
+            // Emit the longest match.
+            w.push(cur, width);
+
+            if next_code <= max_code {
+                keys[slot] = key;
+                vals[slot] = next_code;
+                next_code += 1;
+                if next_code > (1u16 << width) && width < 12 {
+                    width += 1;
+                }
+            } else {
+                // The dictionary is full. Tell the reader to start over, then begin
+                // the next sequence from `c` WITHOUT recording `(cur, c)`: a reader
+                // that has just seen CLEAR treats the following code as the first of
+                // a new sequence and adds no entry for it. Recording one here would
+                // leave the two dictionaries a step apart and corrupt the stream.
+                w.push(clear, width);
+                keys.fill(u32::MAX);
+                next_code = eoi + 1;
+                width = min_code_size + 1;
+            }
             cur = c;
-            have_cur = true;
-            continue;
         }
 
-        let key = ((cur as u32) << 8) | c as u32;
-        let mut slot = (key.wrapping_mul(2654435761) as usize) & mask;
-        let found = loop {
-            match keys[slot] {
-                u32::MAX => break None,
-                k if k == key => break Some(vals[slot]),
-                _ => slot = (slot + 1) & mask,
-            }
-        };
-
-        if let Some(code) = found {
-            cur = code;
-            continue;
+        if have_cur {
+            w.push(cur, width);
         }
-
-        // Emit the longest match.
-        w.push(cur, width);
-
-        if next_code <= max_code {
-            keys[slot] = key;
-            vals[slot] = next_code;
-            next_code += 1;
-            if next_code > (1u16 << width) && width < 12 {
-                width += 1;
-            }
-        } else {
-            // The dictionary is full. Tell the reader to start over, then begin
-            // the next sequence from `c` WITHOUT recording `(cur, c)`: a reader
-            // that has just seen CLEAR treats the following code as the first of
-            // a new sequence and adds no entry for it. Recording one here would
-            // leave the two dictionaries a step apart and corrupt the stream.
-            w.push(clear, width);
-            keys.fill(u32::MAX);
-            next_code = eoi + 1;
-            width = min_code_size + 1;
-        }
-        cur = c;
+        w.push(eoi, width);
+        w.flush();
+        Ok(&w.out)
     }
-
-    if have_cur {
-        w.push(cur, width);
-    }
-    w.push(eoi, width);
-    Ok(w.finish())
 }
 
 #[cfg(test)]
@@ -435,7 +539,12 @@ mod tests {
 
     impl<'a> LzwReader<'a> {
         fn new(data: &'a [u8]) -> Self {
-            LzwReader { data, pos: 0, acc: 0, nbits: 0 }
+            LzwReader {
+                data,
+                pos: 0,
+                acc: 0,
+                nbits: 0,
+            }
         }
 
         fn read(&mut self, width: u8) -> Option<u16> {
@@ -603,5 +712,65 @@ mod tests {
         assert_eq!(back, indices);
         // A run of one value must compress dramatically.
         assert!(packed.len() < indices.len() / 20);
+    }
+
+    #[test]
+    fn reused_dictionary_resets_between_frames_and_after_errors() {
+        let mut scratch = LzwScratch::default();
+        for bits in [8, 2, 4, 8, 2] {
+            let input: Vec<_> = (0..100_000u32)
+                .map(|i| ((i * 97 + i / 19) % (1 << bits)) as u8)
+                .collect();
+            let packed = scratch
+                .compress(input.iter().copied(), input.len(), bits)
+                .unwrap();
+            assert_eq!(lzw_decompress(packed, bits).unwrap().0, input);
+            assert!(scratch.compress([0, 4].into_iter(), 2, 2).is_err());
+        }
+    }
+
+    #[test]
+    fn rectangle_reads_only_selected_rows_and_rejects_out_of_bounds() {
+        let palette = Palette {
+            colors: vec![[0, 0, 0], [255, 255, 255]],
+        };
+        let indices = [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0];
+        let frame = FrameSpec {
+            width: 4,
+            height: 3,
+            indices: &indices,
+            palette: &palette,
+            local_table: false,
+            delay_cs: 10,
+            disposal: Disposal::DoNotDispose,
+            transparent: None,
+        };
+        let region = FrameRegion {
+            left: 1,
+            top: 1,
+            width: 2,
+            height: 2,
+        };
+        let mut block = Vec::new();
+        frame_block_into(&frame, region, &mut LzwScratch::default(), &mut block).unwrap();
+        assert_eq!(&block[9..17], &[1, 0, 1, 0, 2, 0, 2, 0]);
+        let mut data = Vec::new();
+        let mut p = 19;
+        while block[p] != 0 {
+            let n = block[p] as usize;
+            data.extend_from_slice(&block[p + 1..p + 1 + n]);
+            p += 1 + n;
+        }
+        assert_eq!(
+            lzw_decompress(&data, block[18]).unwrap().0,
+            vec![0, 1, 1, 1]
+        );
+        assert!(frame_block_into(
+            &frame,
+            FrameRegion { left: 3, ..region },
+            &mut LzwScratch::default(),
+            &mut block
+        )
+        .is_err());
     }
 }
