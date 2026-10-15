@@ -116,3 +116,7 @@ rustup toolchain install stable-x86_64-pc-windows-gnu
 ## 第三方组件
 
 Easy2GIF 使用 [Qt](https://www.qt.io/) 和 [FFmpeg](https://ffmpeg.org/)。相关许可证与来源信息随发行包附带。
+
+## 许可证
+
+Easy2GIF 的项目代码采用 [MIT License](LICENSE)。发行包根目录附带同一份 `LICENSE`；Qt、FFmpeg 等第三方组件遵循各自的许可证，详见发行包中的 `licenses` 目录。

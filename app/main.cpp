@@ -95,7 +95,7 @@ int main(int argc, char *argv[])
     app.setApplicationName(QStringLiteral("Easy2GIF"));
     app.setApplicationDisplayName(QStringLiteral("Easy2GIF"));
     app.setOrganizationName(QStringLiteral("GifCore"));
-    app.setApplicationVersion(QStringLiteral("1.0.0"));
+    app.setApplicationVersion(QStringLiteral("1.0.1"));
     app.setWindowIcon(QIcon(QStringLiteral(":/branding/easy2gif.png")));
 
     const Options options = parseArgs(app.arguments());

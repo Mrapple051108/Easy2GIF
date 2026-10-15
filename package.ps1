@@ -10,6 +10,8 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $bundle = Join-Path $root 'b\bundle'
+$projectLicense = Join-Path $root 'LICENSE'
+if (!(Test-Path -LiteralPath $projectLicense -PathType Leaf)) { throw 'Project LICENSE is required for packaging.' }
 if ($SevenZip -and $SevenZipOnly) { throw 'Use either -SevenZip or -SevenZipOnly.' }
 if ($SevenZip -or $SevenZipOnly) {
     $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
@@ -35,13 +37,14 @@ $commit = (& git -C $root rev-parse HEAD).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot determine source revision.' }
 $dirty = [bool](& git -C $root status --porcelain --untracked-files=normal)
 $suffix = if ($dirty) { '-dirty' } else { '' }
-$name = "easy2gif-1.0.0-windows-x64-$($commit.Substring(0,7))$suffix"
+$name = "easy2gif-1.0.1-windows-x64-$($commit.Substring(0,7))$suffix"
 $stage = Join-Path $root ('.probe\package-' + [guid]::NewGuid().ToString('N'))
 # A new release gets a new executable path, so Explorer does not reuse the
 # cached icon of a previous release extracted into the same destination.
 $app = Join-Path $stage $name
 $output = Join-Path $root 'b\releases'
 New-Item -ItemType Directory -Force -Path $app, (Join-Path $app 'bin'), (Join-Path $app 'licenses'), $output | Out-Null
+Copy-Item -LiteralPath $projectLicense -Destination (Join-Path $app 'LICENSE')
 
 # Start from a fresh directory. Include only runtime files, never scratch data
 # or executables left behind by an earlier target name.
@@ -83,6 +86,9 @@ Easy2GIF
 
 Extract the whole folder, then run easy2gif.exe. Keep bin/, qml/ and DLLs beside it.
 No separate Qt or FFmpeg installation is required.
+
+Easy2GIF is licensed under the MIT License; see LICENSE in this folder.
+Third-party components retain their own licenses in licenses/.
 
 Source: https://github.com/Mrapple051108/Easy2GIF
 Qt: https://www.qt.io/licensing/ ; https://download.qt.io/archive/qt/

@@ -1,6 +1,6 @@
 [package]
 name = "gifcore"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Rust core library: video probing, frame access and GIF encoding for the QML front-end"
 license = "MIT"
