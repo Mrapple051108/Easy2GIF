@@ -18,7 +18,7 @@
     tree therefore produces Low-labelled binaries -- and a Low process may only
     write where a matching Low label is present. That is exactly how the CLion
     Run path broke: `forge.exe` was born Low inside `b`, so it ran Low, and even
-    though `gifforge.exe` itself was labelled Medium the export was still
+    though `easy2gif.exe` itself was labelled Medium the export was still
     refused, because a Low *parent* cannot create a Medium child and the shell it
     started was Low too.
 
@@ -73,7 +73,7 @@
     It is not a CLion setting and CLion needs no configuration.
 
 .PARAMETER Store
-    Where the real folders live. Defaults to %LOCALAPPDATA%\GifForge-build.
+    Where the real folders live. Defaults to %LOCALAPPDATA%\easy2gif-build.
     Must be outside the project.
 
 .PARAMETER Root
@@ -84,7 +84,7 @@
 
 .EXAMPLE
     pwsh -File .\relocate.ps1
-    pwsh -File .\relocate.ps1 -Store D:\GifForge-build
+    pwsh -File .\relocate.ps1 -Store D:\easy2gif-build
 
 .NOTES
     Run from a normal terminal (or CLion's Terminal). A shell that is itself
@@ -101,7 +101,7 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $Root) { throw 'Run this with -File, or pass -Root <project folder>.' }
 $Root = (Resolve-Path -LiteralPath $Root).Path
-if (-not $Store) { $Store = Join-Path $env:LOCALAPPDATA 'GifForge-build' }
+if (-not $Store) { $Store = Join-Path $env:LOCALAPPDATA 'easy2gif-build' }
 $Store = [IO.Path]::GetFullPath($Store)
 
 if ($Store.StartsWith($Root + [IO.Path]::DirectorySeparatorChar, 'OrdinalIgnoreCase')) {
@@ -116,7 +116,7 @@ if ($Store.StartsWith($Root + [IO.Path]::DirectorySeparatorChar, 'OrdinalIgnoreC
 # into the junctioned bundle by the build instead, so it sits next to the front
 # end.
 $Links = @(
-    @{ Link = 'b\bundle'; Store = 'bundle' }   # gifforge.exe, forge.exe, Qt DLLs, bin\ffmpeg.exe
+    @{ Link = 'b\bundle'; Store = 'bundle' }   # easy2gif.exe, forge.exe, Qt DLLs, bin\ffmpeg.exe
 )
 
 Write-Host "项目    $Root"
@@ -168,7 +168,7 @@ foreach ($build in @('b', 'target', '.rustup_local')) { Set-Integrity (Join-Path
 # defence. The build does this by itself (see the integrity section of
 # CMakeLists.txt); this is the repair for copies, and for what was written
 # before that existed.
-foreach ($exe in @('b\bundle\gifforge.exe', 'b\bundle\forge.exe',
+foreach ($exe in @('b\bundle\easy2gif.exe', 'b\bundle\forge.exe',
                    'b\bundle\bin\ffmpeg.exe', 'b\bundle\bin\ffprobe.exe')) {
     $path = Join-Path $Root $exe
     if (Test-Path -LiteralPath $path) {
@@ -214,7 +214,7 @@ foreach ($entry in $Links) {
 
 Write-Host ''
 $ready = 0
-foreach ($exe in @('b\bundle\gifforge.exe', 'target\release\forge.exe')) {
+foreach ($exe in @('b\bundle\easy2gif.exe', 'target\release\forge.exe')) {
     $full = Join-Path $Root $exe
     if (Test-Path -LiteralPath $full) {
         $parent = Split-Path $exe -Parent

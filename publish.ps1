@@ -14,10 +14,10 @@
     已经验证过的边界（同一个 bundle、同一条命令行、同一个目标目录，只有 exe 的
     位置不同）：
 
-        项目目录内     C:\...\untitled4\b\bundle\gifforge.exe   -> 拒绝访问
+        项目目录内     C:\...\untitled4\b\bundle\easy2gif.exe   -> 拒绝访问
         项目目录内     C:\...\untitled4\.probe\ws-bundle\...    -> 拒绝访问
         项目目录外     C:\Users\17189\CLionProjects\outside-... -> 正常，724604 字节
-        项目目录外     %LOCALAPPDATA%\GifForge\gifforge.exe     -> 正常，724604 字节
+        项目目录外     %LOCALAPPDATA%\easy2gif\easy2gif.exe     -> 正常，724604 字节
 
     注意边界是 untitled4 这一层，不是整个 CLionProjects。所以把 bundle 复制到项目
     之外再运行，限制就不适用了，导出到任意位置都正常。这与 CLion 无关，CLion 里
@@ -26,7 +26,7 @@
     这个脚本只做复制和自检，不重新编译。要先编译请看 build.ps1。
 
 .PARAMETER Destination
-    目标目录，默认 %LOCALAPPDATA%\GifForge。
+    目标目录，默认 %LOCALAPPDATA%\easy2gif。
 
 .PARAMETER Launch
     复制完直接把它启动起来。
@@ -37,11 +37,11 @@
 .EXAMPLE
     .\publish.ps1
     .\publish.ps1 -Launch
-    .\publish.ps1 -Destination D:\Tools\GifForge -Launch
+    .\publish.ps1 -Destination D:\Tools\easy2gif -Launch
 #>
 [CmdletBinding()]
 param(
-    [string]$Destination = (Join-Path $env:LOCALAPPDATA 'GifForge'),
+    [string]$Destination = (Join-Path $env:LOCALAPPDATA 'easy2gif'),
     [switch]$Launch,
     [switch]$Force
 )
@@ -52,8 +52,8 @@ Set-StrictMode -Version Latest
 $root = $PSScriptRoot
 $source = Join-Path $root 'b\bundle'
 
-if (-not (Test-Path (Join-Path $source 'gifforge.exe'))) {
-    throw "没找到 $source\gifforge.exe。先跑 .\build.ps1（或在 CLion 里构建 bundle 目标）。"
+if (-not (Test-Path (Join-Path $source 'easy2gif.exe'))) {
+    throw "没找到 $source\easy2gif.exe。先跑 .\build.ps1（或在 CLion 里构建 bundle 目标）。"
 }
 
 # 复制目标不能落在项目目录里面，否则等于没搬。
@@ -63,18 +63,15 @@ if ($destFull -eq $rootFull -or $destFull.StartsWith($rootFull + '\', [StringCom
     throw "目标目录不能放在项目目录里面（$rootFull），换一个位置。"
 }
 
-$exe = Join-Path $destFull 'gifforge.exe'
+$exe = Join-Path $destFull 'easy2gif.exe'
 
 # 目标已经是最新的就跳过，这样把它当成 CLion 的 Run 步骤时不会每次都搬 285 MB。
 function Get-Stamp([string]$dir) {
-    $parts = foreach ($rel in @('gifforge.exe', 'bin\ffmpeg.exe', 'bin\ffprobe.exe')) {
-        $f = Join-Path $dir $rel
-        if (Test-Path $f) {
-            $i = Get-Item $f
-            "$rel=$($i.Length)/$($i.LastWriteTimeUtc.Ticks)"
-        } else {
-            "$rel=missing"
-        }
+    $base = [IO.Path]::GetFullPath($dir).TrimEnd('\') + '\'
+    $parts = foreach ($i in (Get-ChildItem -LiteralPath $dir -Recurse -File | Sort-Object FullName)) {
+        if ($i.Extension -in @('.log', '.part') -or $i.FullName -like '*\gifcore-tmp\*') { continue }
+        $rel = $i.FullName.Substring($base.Length)
+        "$rel=$($i.Length)/$($i.LastWriteTimeUtc.Ticks)"
     }
     ($parts -join '|')
 }

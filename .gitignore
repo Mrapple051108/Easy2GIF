@@ -1,6 +1,7 @@
 # 构建产物
 /target/
 /b/
+/.deps/
 /gifcore-tmp/
 
 # 装在项目里的本地 Rust 工具链（约 840 MB，绝不入库）

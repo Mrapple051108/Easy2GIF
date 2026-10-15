@@ -68,7 +68,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $rustupHome 'toolchains'))) {
 # A launcher shim (the chocolatey one, for instance) is a few hundred KiB and
 # resolves its real target *relative to its own location*. Copying one into the
 # bundle therefore yields an engine that only works on the machine that built
-# it. A genuinely self-contained engine is a static build, tens of megabytes.
+# it. Accept a real static build or a shared build with adjacent codec DLLs.
 $minEngineBytes = 5MB
 
 function Resolve-MediaTool([string] $Name, [string] $Explicit) {
@@ -88,7 +88,10 @@ function Resolve-MediaTool([string] $Name, [string] $Explicit) {
 
     foreach ($candidate in $candidates) {
         $item = Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue
-        if ($item -and $item.Length -ge $minEngineBytes) { return $item }
+        if ($item -and ($item.Length -ge $minEngineBytes -or
+            (Get-ChildItem -LiteralPath $item.DirectoryName -Filter 'avcodec-*.dll' -ErrorAction SilentlyContinue))) {
+            return $item
+        }
     }
 
     $first = $candidates | Select-Object -First 1
@@ -108,7 +111,7 @@ if ($ffmpegItem -and $ffprobeItem) {
         -ForegroundColor DarkGray
 } else {
     Write-Warning 'No self-contained ffmpeg/ffprobe found; the bundle would not run.'
-    Write-Warning 'Pass -FfmpegExe/-FfprobeExe pointing at a static build.'
+    Write-Warning 'Pass -FfmpegExe/-FfprobeExe pointing at a real static or shared distribution.'
 }
 
 $configureArgs = @(
@@ -139,8 +142,8 @@ if (-not $SkipBundle) {
     $size = (Get-ChildItem $bundle -Recurse -File | Measure-Object -Property Length -Sum).Sum / 1MB
     Write-Host ''
     Write-Host ("Bundle ready: {0}  ({1:N1} MiB)" -f $bundle, $size) -ForegroundColor Green
-    Write-Host 'It is self-contained: copy the folder anywhere and run gifforge.exe.'
+    Write-Host 'It is self-contained: copy the folder anywhere and run easy2gif.exe.'
 } else {
     Write-Host ''
-    Write-Host ("Executable: {0}" -f (Join-Path $root "$BuildDir\gifforge.exe")) -ForegroundColor Green
+    Write-Host ("Executable: {0}" -f (Join-Path $root "$BuildDir\bundle\easy2gif.exe")) -ForegroundColor Green
 }

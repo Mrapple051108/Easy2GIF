@@ -62,7 +62,7 @@ fn scratch_candidates() -> Vec<PathBuf> {
     // 4. Per-user application data.
     if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         if !base.is_empty() {
-            out.push(PathBuf::from(base).join("GifForge").join("tmp"));
+            out.push(PathBuf::from(base).join("easy2gif").join("tmp"));
         }
     }
     // 5. Wherever we happen to have been started from.

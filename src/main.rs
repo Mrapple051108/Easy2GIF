@@ -26,7 +26,7 @@
 //!    label. The failure this project actually hit was exactly that ceiling, in
 //!    the shape CLion's Run button builds: a Low *parent* cannot create a Medium
 //!    child, so once `forge` came out Low, the shell it started was Low too, no
-//!    matter that `gifforge.exe` itself was labelled Medium.
+//!    matter that `easy2gif.exe` itself was labelled Medium.
 //!
 //!    The fix is to keep every build directory at ordinary (Medium) integrity, so
 //!    nothing is ever *born* Low:
@@ -34,7 +34,7 @@
 //!    * `b`, `target`, `.rustup_local` and the deployment folder carry no Low
 //!      label. New files inherit the label of the directory holding them, which is
 //!      why a Low build tree produced Low binaries.
-//!    * The build's final `icacls` step re-stamps `gifforge.exe`, `forge.exe` and
+//!    * The build's final `icacls` step re-stamps `easy2gif.exe`, `forge.exe` and
 //!      the bundled media tools with `M` as a second line of defence.
 //!
 //!    A Low process cannot raise its own label — the privilege that would take is
@@ -44,7 +44,7 @@
 //!    terminal. `relocate.ps1` repairs labels that were lost by copying or moving.
 //!
 //!    This is not a CLion setting and CLion needs no configuration.
-//! 3. **Pull up the shell.** `gifforge.exe` — the C++/QML front end — is located,
+//! 3. **Pull up the shell.** `easy2gif.exe` — the C++/QML front end — is located,
 //!    started, and waited for; its exit code becomes ours.
 //!
 //! These are one program at build time: the shell links this very kernel as a
@@ -53,7 +53,7 @@
 //! process.
 //!
 //! ```text
-//! forge [--shell <gifforge.exe>] [--dest <dir>] [--probe <video>]
+//! forge [--shell <easy2gif.exe>] [--dest <dir>] [--probe <video>]
 //!       [--no-shell] [--publish] [--publish-only] [--help]
 //!       [-- <arguments for the shell>]
 //! ```
@@ -70,7 +70,7 @@ use std::process::Command;
 use gifcore::ffi;
 
 /// The front end this launcher starts.
-const SHELL_NAME: &str = "gifforge.exe";
+const SHELL_NAME: &str = "easy2gif.exe";
 
 /// Build trees to search, relative to the package root. The bundle comes first
 /// because it carries its own Qt and therefore needs nothing from `PATH`.
@@ -251,7 +251,7 @@ fn publish_shell(
 }
 
 fn default_dest() -> Option<PathBuf> {
-    env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("GifForge"))
+    env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("easy2gif"))
 }
 
 fn publish(source_dir: &Path, dest: &Path) -> Result<(), String> {
@@ -474,7 +474,7 @@ fn child_path(shell: &Path) -> Option<OsString> {
 
 /// The build tree recorded where Qt was found when it was configured; that is
 /// where the Qt DLLs live. Checked in the exe's own directory and one level up,
-/// so `b/gifforge.exe` and `b/bundle/gifforge.exe` both resolve.
+/// so `b/easy2gif.exe` and `b/bundle/easy2gif.exe` both resolve.
 fn qt_bin_near(shell: &Path) -> Option<PathBuf> {
     let dir = shell.parent()?;
     qt_bin_from_cache(dir).or_else(|| dir.parent().and_then(qt_bin_from_cache))
@@ -539,14 +539,14 @@ fn last_error(handle: *mut ffi::GifCore) -> String {
 fn print_help() {
     println!(
         "\
-forge — 先跑内核自检，再拉起外壳（gifforge.exe）
+forge — 先跑内核自检，再拉起外壳（easy2gif.exe）
 
 用法：
   forge [选项] [外壳参数…]
 
 选项：
-  --shell <路径>   指定 gifforge.exe 的来源（默认在 b/bundle、b/ 等目录里找）
-  --dest <目录>    发布到哪个目录（默认 %LOCALAPPDATA%\\GifForge）
+  --shell <路径>   指定 easy2gif.exe 的来源（默认在 b/bundle、b/ 等目录里找）
+  --dest <目录>    发布到哪个目录（默认 %LOCALAPPDATA%\\easy2gif）
   --publish        先把外壳复制到 --dest 再启动（默认不复制）
   --publish-only   只发布，不启动（发布失败时退出码 4）
   --probe <视频>   额外让内核探测一个视频并打印结果
@@ -561,7 +561,7 @@ forge — 先跑内核自检，再拉起外壳（gifforge.exe）
 所以构建目录和程序都必须是不带「低」标签的普通（中）完整性：
   * b、target、.rustup_local 和部署目录都不贴 Low，这样新生成的 exe 出生就是中完整性
     （新建的文件会继承所在目录的标签，目录带 Low 的话程序就跟着 Low）；
-  * 构建的最后一步会再给 gifforge.exe、forge.exe、bin\\ffmpeg.exe、bin\\ffprobe.exe
+  * 构建的最后一步会再给 easy2gif.exe、forge.exe、bin\\ffmpeg.exe、bin\\ffprobe.exe
     显式贴一次 M，多一层保险。
 低完整性进程**无法**把自己的标签提上去（需要的特权正是沙箱不给的那个），所以一旦程序
 以低完整性跑起来，它自己是修不好的：界面顶部会出现「沙箱运行 · 导出受限」，这时请从

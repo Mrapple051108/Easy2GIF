@@ -5,9 +5,7 @@
 选中区间靠两条进度条上的可拖动竖线，也可以直接输入时间点；界面会实时显示
 选区的总时长。导出完全由 Rust 内核完成，界面只负责把用户意图转发过去。
 
-> 仓库和程序的对外名字是 **Easy2GIF**。为了不破坏已经验证过的构建脚本、CLion
-> 运行配置和缓存目录，内部的 CMake 工程、可执行文件名和 `%LOCALAPPDATA%` 目录
-> 仍然沿用旧名（`GifForge` / `gifforge.exe`）——下文出现的这类路径都是真实存在的。
+程序、CMake 目标和 QML 模块统一使用 `easy2gif`；界面品牌为 **Easy2GIF**。
 
 ## 不依赖任何系统插件
 
@@ -121,7 +119,7 @@ ffmpeg 这种第三方解码器**核对帧数与字节数。
   `src/main.rs`（`cargo run --offline --bin forge`）：**先把内核跑起来**做体检，
   **再把 C++/QML 外壳拉起来**并等它退出。详见下一节。
 - **`Easy2GIF`** —— 直接跑 Qt 界面那个可执行文件
-  （`.idea/runConfigurations/GIF_Forge.xml`）。
+  （`.idea/runConfigurations/easy2gif.xml`）。
 - **`Rust 内核测试`** —— 执行 `cargo test --offline`。
 
 构件配置方面：`CMakePresets.json` 的 `mingw-release` 预设一口气指定了生成器、
@@ -141,7 +139,7 @@ Studio，`CMakeLists.txt` 会直接报错并提示换工具链）。原因是 Ru
 1. **启动内核** —— 解析媒体引擎（优先用外壳旁边自带的那套 `bin/`，否则回退到
    `PATH`）、通过 `include/gifcore.h` 那套 C ABI 建一个内核句柄、让它自检工具
    并报告线程预算。加 `--probe <视频>` 还会真跑一次探测。
-2. **拉起外壳** —— 找到 `gifforge.exe`，启动，等它退出，把它的退出码当成自己的。
+2. **拉起外壳** —— 找到 `easy2gif.exe`，启动，等它退出，把它的退出码当成自己的。
 
 两者在编译期是同一个程序：外壳把这份内核作为静态库链了进去。所以这个入口是
 "一条方便的、自带体检的入口"，而不是中间代理 —— 外壳跑的是它自己那份内核实例，
@@ -192,6 +190,23 @@ Rust 工具链装在仓库内的 `.rustup_local`（用户目录在此环境下�
 目标平台是 `stable-x86_64-pc-windows-gnu`——本机没有 MSVC 编译器，而 Qt 是
 MinGW 版，两边必须一致。
 
+### 生成发布压缩包
+
+```powershell
+.\package.ps1 -SharedMedia -SevenZip   # 构建精简版，同时生成 ZIP 和 7z
+.\package.ps1 -SkipBuild              # 将当前 bundle 打成 ZIP
+```
+
+压缩包与 SHA256 文件保存在 `b\releases`，解压整个文件夹后运行 `easy2gif.exe`。
+`-SharedMedia` 下载固定版本、校验 SHA256，使用 FFmpeg/FFprobe 共用的 DLL，
+避免两份静态程序包含重复的编解码代码；依赖源码地址和许可证随包附带。
+也可向 `build.ps1` 传入其他完整的静态或共享版媒体工具。7z 需要支持该格式的
+Windows 自带 `tar.exe`；不加 `-SevenZip` 时只生成通用 ZIP。
+
+脚本使用全新暂存目录和媒体文件清单，不会把旧构建残留、临时视频或日志混入包内。
+文件名与 `BUILD.json` 记录源码提交；源码存在未提交变动时会标记 `dirty`。
+体积对比及后续可优化方向见 [包体优化记录](docs/package-size.md)。
+
 ## 运行位置与完整性标签：一个很容易踩的坑
 
 **写入能不能成功，取决于这个 exe **文件本身**带的完整性标签。**
@@ -218,7 +233,7 @@ Windows 对**低完整性**进程有一条强制策略：它只能往同样带**
 1. **新文件继承所在目录的标签**，所以**构建目录一旦是 Low，生成的 exe 就是 Low**。
    因此 `b`、`target`、`.rustup_local`、部署目录全部保持普通（Medium）。
 2. **低完整性的父进程会把子进程压回低完整性**：CLion 的 Run 拉起来的 `forge.exe` 是
-   Low，它再拉起的 `gifforge.exe` 也是 Low —— 哪怕 `gifforge.exe` 自己贴了 M，
+   Low，它再拉起的 `easy2gif.exe` 也是 Low —— 哪怕 `easy2gif.exe` 自己贴了 M，
    导出照样被拒。
 3. **低完整性进程改不了自己的标签**，它需要的那个权限正是沙箱抽掉的那个；所以
    「程序发现自己被拒 → 用 `icacls` 给自己升权 → 重启」这条路走不通（试过，代码已删）。
@@ -243,7 +258,7 @@ exe 能到什么身份，**父进程的令牌**决定上限。
 
 ```powershell
 icacls b\rust\release\forge.exe   # 必须是 Medium —— 它决定 CLion 的 Run 跑出来是什么身份
-icacls b\bundle\gifforge.exe      # 必须是 Medium
+icacls b\bundle\easy2gif.exe      # 必须是 Medium
 icacls b                          # 也必须是 Medium：(OI)(CI)(NW)，不是 Low
 icacls target                     # 同理：cargo test 的测试程序在这里生成
 ```
@@ -278,9 +293,9 @@ write the blocker file: Os { code: 5, kind: PermissionDenied, message: "拒绝�
 **怎么修，一句话：把构建目录变回普通（Medium）。**
 
 - **导出被拒 / 界面上出现橙色「沙箱运行 · 导出受限」**：这个进程是低完整性。先分清是
-  *文件* 的问题还是 *启动方式* 的问题 —— `icacls b\bundle\gifforge.exe`。显示 Low 就重新
+  *文件* 的问题还是 *启动方式* 的问题 —— `icacls b\bundle\easy2gif.exe`。显示 Low 就重新
   构建一次（构建的最后一步会把 4 个程序贴回 M），或者手动改：
-  `icacls b\bundle\gifforge.exe /setintegritylevel M`（`forge.exe`、`b\rust\release\forge.exe`、
+  `icacls b\bundle\easy2gif.exe /setintegritylevel M`（`forge.exe`、`b\rust\release\forge.exe`、
   `bin\ffmpeg.exe`、`bin\ffprobe.exe` 同理）。文件已经是 Medium 却还是被拒，那就是
   **启动它的那个进程是 Low**（受限终端/沙箱，或从那里启动的 CLion）：换成从资源管理器、
   开始菜单，或**正常方式启动的 CLion**里 Run。
@@ -292,14 +307,14 @@ write the blocker file: Os { code: 5, kind: PermissionDenied, message: "拒绝�
 
 ### `relocate.ps1`
 
-重建并重新贴标签（部署目录默认放 `%LOCALAPPDATA%\GifForge-build`，可用 `-Store` 改；
+重建并重新贴标签（部署目录默认放 `%LOCALAPPDATA%\easy2gif-build`，可用 `-Store` 改；
 脚本可反复运行）：
 
 ```powershell
 .\relocate.ps1
 ```
 
-exe 的路径仍然是 `b\bundle\gifforge.exe`，CLion 的 Run 和 `cmake --build` 都不用改。
+exe 的路径仍然是 `b\bundle\easy2gif.exe`，CLion 的 Run 和 `cmake --build` 都不用改。
 `b\bundle` 是指向项目外的 **junction**（构建过程把前端产物直接写进去，所以它同时是
 部署目录）；`target\release` 特意保持真实目录，因为 cargo 要往那里写自己的构建锁
 （`.cargo-build-lock`），路径一旦穿过 junction 它就会拒绝。Rust 入口 `forge.exe`
@@ -308,9 +323,9 @@ exe 的路径仍然是 `b\bundle\gifforge.exe`，CLion 的 Run 和 `cmake --buil
 `publish.ps1` 是另一条路——把整个 bundle 复制到干净位置再运行：
 
 ```powershell
-.\publish.ps1             # 复制到 %LOCALAPPDATA%\GifForge（已经是最新就跳过）
+.\publish.ps1             # 复制到 %LOCALAPPDATA%\easy2gif（已经是最新就跳过）
 .\publish.ps1 -Launch     # 复制完直接启动
-.\publish.ps1 -Destination D:\Tools\GifForge -Launch   # 换个位置
+.\publish.ps1 -Destination D:\Tools\easy2gif -Launch   # 换个位置
 .\publish.ps1 -Force      # 强制重新复制
 ```
 
@@ -331,7 +346,7 @@ exe 的路径仍然是 `b\bundle\gifforge.exe`，CLion 的 Run 和 `cmake --buil
 1. `GIFCORE_TEMP` 环境变量（显式指定优先）
 2. `%TEMP%\gifcore-tmp`
 3. **程序自己所在目录**下的 `gifcore-tmp`
-4. `%LOCALAPPDATA%\GifForge\tmp`
+4. `%LOCALAPPDATA%\easy2gif\tmp`
 5. 当前工作目录下的 `gifcore-tmp`
 
 每个候选都会**真的建一个文件试一下**，取第一个成功的。全部失败时，报错会把
@@ -355,7 +370,7 @@ cargo test --offline
 ## 命令行（便于自动化与排查）
 
 ```
-gifforge.exe --open <视频> [--screenshot <png>] [--export <gif>]
+easy2gif.exe --open <视频> [--screenshot <png>] [--export <gif>]
              [--delay <毫秒>] [--threads <0=自动|n>] [--log <文件>]
 ```
 

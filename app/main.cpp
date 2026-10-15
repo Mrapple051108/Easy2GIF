@@ -109,7 +109,7 @@ int main(int argc, char *argv[])
         &engine, &QQmlApplicationEngine::objectCreationFailed, &app,
         []() { QCoreApplication::exit(-1); }, Qt::QueuedConnection);
 
-    engine.loadFromModule("GifForge", "Main");
+    engine.loadFromModule("easy2gif", "Main");
     if (engine.rootObjects().isEmpty()) {
         return -1;
     }

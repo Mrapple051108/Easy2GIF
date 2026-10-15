@@ -6,14 +6,14 @@ cmake_minimum_required(VERSION 3.21)
 #   * `gifcore`  — the Rust kernel. It owns every part of the video pipeline
 #                  (probing, decoding, colour reduction, GIF encoding) and is
 #                  consumed through the plain C ABI in include/gifcore.h.
-#   * `gifforge` — the Qt Quick front end. It presents kernel state and
+#   * `easy2gif` — the Qt Quick front end. It presents kernel state and
 #                  forwards user intent; it never touches video data.
 #
 # The kernel is compiled with the GNU toolchain and linked in as a static
 # library, so nothing extra has to be installed alongside the executable.
 # ---------------------------------------------------------------------------
 
-project(GifForge VERSION 1.0.0 LANGUAGES CXX)
+project(easy2gif VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -153,18 +153,23 @@ set(GIFCORE_QML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/app/qml")
 # and Run needs nothing on PATH beyond what the run configuration already sets.
 set(GIFCORE_BUNDLE_DIR "${CMAKE_BINARY_DIR}/bundle")
 
-qt_add_executable(gifforge
+qt_add_executable(easy2gif
     app/main.cpp
     app/GifBridge.cpp
     app/GifBridge.h
 )
 
-if(NOT GIFCORE_CONSOLE AND WIN32)
-    set_target_properties(gifforge PROPERTIES WIN32_EXECUTABLE TRUE)
+# Rust is already stripped; drop the final MinGW symbol table in Release too.
+if(MINGW)
+    target_link_options(easy2gif PRIVATE "$<$<CONFIG:Release>:-s>")
 endif()
 
-qt_add_qml_module(gifforge
-    URI GifForge
+if(NOT GIFCORE_CONSOLE AND WIN32)
+    set_target_properties(easy2gif PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
+qt_add_qml_module(easy2gif
+    URI easy2gif
     VERSION 1.0
     RESOURCE_PREFIX "/qt/qml"
     QML_FILES
@@ -172,7 +177,7 @@ qt_add_qml_module(gifforge
         app/qml/FrameSlider.qml
 )
 
-set_target_properties(gifforge PROPERTIES
+set_target_properties(easy2gif PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${GIFCORE_BUNDLE_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${GIFCORE_BUNDLE_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${GIFCORE_BUNDLE_DIR}"
@@ -180,22 +185,22 @@ set_target_properties(gifforge PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${GIFCORE_BUNDLE_DIR}"
 )
 
-target_include_directories(gifforge PRIVATE
+target_include_directories(easy2gif PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/app")
 
-target_link_libraries(gifforge PRIVATE
+target_link_libraries(easy2gif PRIVATE
     Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2
     "${GIFCORE_RUST_LIBRARY}")
 
 # The Rust static library pulls in parts of the Windows runtime.
 if(WIN32)
-    target_link_libraries(gifforge PRIVATE
+    target_link_libraries(easy2gif PRIVATE
         ws2_32 userenv bcrypt ntdll ole32 oleaut32 setupapi advapi32
         shell32 user32 gdi32)
 endif()
 
-add_dependencies(gifforge gifcore_rust)
+add_dependencies(easy2gif gifcore_rust)
 
 # ---------------------------------------------------------------------------
 # Bundling: everything the app needs travels with it
@@ -209,7 +214,7 @@ find_program(GIFCORE_WINDEPLOYQT NAMES windeployqt windeployqt.exe
 # The bundled media engine. Override with -DGIFCORE_FFMPEG_EXE=... to point at
 # another build.
 #
-# A real static build is preferred over whatever ``find_program`` finds on PATH,
+# A real distribution is preferred over whatever ``find_program`` finds on PATH,
 # because a package-manager shim (chocolatey, winget, scoop) is only a few
 # hundred KiB and resolves its real target relative to its own location. Running
 # such a shim on this machine works; copying it into the bundle produces an
@@ -226,7 +231,9 @@ function(gifcore_find_media_tool var name)
     foreach(_candidate IN LISTS _real_candidates)
         if(EXISTS "${_candidate}")
             file(SIZE "${_candidate}" _size)
-            if(_size GREATER 1048576)
+            get_filename_component(_candidate_dir "${_candidate}" DIRECTORY)
+            file(GLOB _codec_dlls "${_candidate_dir}/avcodec-*.dll")
+            if(_size GREATER 1048576 OR _codec_dlls)
                 set(${var} "${_candidate}" CACHE FILEPATH "Bundled ${name} executable" FORCE)
                 return()
             endif()
@@ -250,11 +257,17 @@ function(gifcore_report_tool tool path)
         return()
     endif()
     file(SIZE "${path}" _size)
+    get_filename_component(_tool_dir "${path}" DIRECTORY)
+    file(GLOB _shared_codec "${_tool_dir}/avcodec-*.dll")
+    if(_shared_codec)
+        message(STATUS "Easy2GIF: ${tool} = ${path} (shared media runtime)")
+        return()
+    endif()
     if(_size LESS 1048576)
         message(WARNING
             "Easy2GIF: ${path} is only ${_size} bytes, which looks like a launcher "
             "shim rather than a real build. A bundled shim will not run on another "
-            "machine; point -DGIFCORE_${tool}_EXE at a static build instead.")
+            "machine; point -DGIFCORE_${tool}_EXE at a real static or shared distribution.")
     else()
         math(EXPR _mb "${_size} / 1048576")
         message(STATUS "Easy2GIF: ${tool} = ${path} (~${_mb} MiB)")
@@ -270,32 +283,33 @@ gifcore_report_tool(FFPROBE "${GIFCORE_FFPROBE_EXE}")
 add_custom_target(bundle
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${GIFCORE_BUNDLE_DIR}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "$<TARGET_FILE:gifforge>" "${GIFCORE_BUNDLE_DIR}/"
+            "$<TARGET_FILE:easy2gif>" "${GIFCORE_BUNDLE_DIR}/"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
             "${GIFCORE_RUST_FORGE}" "${GIFCORE_BUNDLE_DIR}/"
     COMMAND "${GIFCORE_WINDEPLOYQT}" --release --no-translations
+            --skip-plugin-types qmltooling,platforminputcontexts,vectorimageformats,generic
             --qmldir "${GIFCORE_QML_DIR}"
-            "${GIFCORE_BUNDLE_DIR}/$<TARGET_FILE_NAME:gifforge>"
+            "${GIFCORE_BUNDLE_DIR}/$<TARGET_FILE_NAME:easy2gif>"
     COMMENT "Collecting Qt runtime and QML plugins"
-    DEPENDS gifforge gifcore_rust
+    DEPENDS easy2gif gifcore_rust
     VERBATIM)
 
 if(GIFCORE_FFMPEG_EXE AND GIFCORE_FFPROBE_EXE)
     add_custom_command(TARGET bundle POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${GIFCORE_BUNDLE_DIR}/bin"
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${GIFCORE_FFMPEG_EXE}" "${GIFCORE_BUNDLE_DIR}/bin/ffmpeg.exe"
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                "${GIFCORE_FFPROBE_EXE}" "${GIFCORE_BUNDLE_DIR}/bin/ffprobe.exe"
+        COMMAND "${CMAKE_COMMAND}"
+                "-DFFMPEG=${GIFCORE_FFMPEG_EXE}"
+                "-DFFPROBE=${GIFCORE_FFPROBE_EXE}"
+                "-DDESTINATION=${GIFCORE_BUNDLE_DIR}/bin"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/BundleMedia.cmake"
         COMMENT "Bundling the media engine into bin/"
         VERBATIM)
 
     # Run the copies from where they now live. This is the only honest test of
     # "needs nothing installed": a launcher shim fails right here with a
-    # "cannot find file at ..\lib\..." message, while a real static build
+    # "cannot find file at ..\lib\..." message, while a complete distribution
     # answers with its version banner and exits 0.
     option(GIFCORE_VERIFY_BUNDLE
-        "Prove the bundled media engine runs standalone (requires a static build)" ON)
+        "Verify the bundled media engine and its runtime dependencies" ON)
     if(GIFCORE_VERIFY_BUNDLE)
         add_custom_command(TARGET bundle POST_BUILD
             COMMAND "${GIFCORE_BUNDLE_DIR}/bin/ffmpeg.exe" -version
@@ -347,11 +361,29 @@ if(GIFCORE_PRUNE_BUNDLE)
     endforeach()
     list(APPEND GIFCORE_PRUNE_COMMANDS
         COMMAND "${CMAKE_COMMAND}" -E rm -rf "${GIFCORE_BUNDLE_DIR}/qmltooling")
+    foreach(_style FluentWinUI3 Fusion Imagine Material Universal Windows)
+        list(APPEND GIFCORE_PRUNE_COMMANDS
+            COMMAND "${CMAKE_COMMAND}" -E rm -rf
+                    "${GIFCORE_BUNDLE_DIR}/qml/QtQuick/Controls/${_style}")
+    endforeach()
+    foreach(_unused platforminputcontexts vectorimageformats generic)
+        list(APPEND GIFCORE_PRUNE_COMMANDS
+            COMMAND "${CMAKE_COMMAND}" -E rm -rf "${GIFCORE_BUNDLE_DIR}/${_unused}")
+    endforeach()
     add_custom_command(TARGET bundle POST_BUILD
         ${GIFCORE_PRUNE_COMMANDS}
         COMMENT "Pruning Qt modules the app never loads"
         VERBATIM)
 endif()
+
+# Resolve Qt only from the deployed directory, including when Qt is installed
+# on the build machine. This also makes clean-machine checks meaningful.
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/qt.conf"
+     "[Paths]\nPrefix=.\nPlugins=.\nQmlImports=qml\n")
+add_custom_command(TARGET bundle POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${CMAKE_CURRENT_BINARY_DIR}/qt.conf" "${GIFCORE_BUNDLE_DIR}/qt.conf"
+    VERBATIM)
 
 # ---------------------------------------------------------------------------
 # Integrity labels: keep everything at ordinary (Medium) integrity.
@@ -366,7 +398,7 @@ endif()
 #
 # A new file inherits the label of the folder it is created in, so a Low build
 # tree produces Low binaries. That is how CLion's Run button broke: `forge.exe`
-# came out Low, and although `gifforge.exe` itself was Medium, a Low parent
+# came out Low, and although `easy2gif.exe` itself was Medium, a Low parent
 # cannot create a Medium child, so the shell it started was Low too. The build
 # directories therefore stay Medium (relocate.ps1 restores that if a copy or a
 # move lost it) and the programs are stamped explicitly as a second line of
@@ -375,7 +407,7 @@ endif()
 # ---------------------------------------------------------------------------
 if(WIN32)
     set(GIFCORE_LAUNCHERS
-        "${GIFCORE_BUNDLE_DIR}/gifforge.exe"
+        "${GIFCORE_BUNDLE_DIR}/easy2gif.exe"
         "${GIFCORE_BUNDLE_DIR}/forge.exe")
     if(GIFCORE_FFMPEG_EXE AND GIFCORE_FFPROBE_EXE)
         # The media tools are driven as child processes and write the raw frames
@@ -386,9 +418,9 @@ if(WIN32)
             "${GIFCORE_BUNDLE_DIR}/bin/ffprobe.exe")
     endif()
 
-    # Building only `gifforge` (what CLion's Run button does) must be enough.
-    add_custom_command(TARGET gifforge POST_BUILD
-        COMMAND icacls "${GIFCORE_BUNDLE_DIR}/gifforge.exe"
+    # Building only `easy2gif` (what CLion's Run button does) must be enough.
+    add_custom_command(TARGET easy2gif POST_BUILD
+        COMMAND icacls "${GIFCORE_BUNDLE_DIR}/easy2gif.exe"
                 /setintegritylevel M /C
         COMMENT "Giving the front end normal integrity"
         VERBATIM)
