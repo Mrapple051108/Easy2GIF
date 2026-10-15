@@ -159,6 +159,17 @@ qt_add_executable(easy2gif
     app/GifBridge.h
 )
 
+if(WIN32)
+    target_sources(easy2gif PRIVATE app/windows.rc)
+    set_property(SOURCE app/windows.rc PROPERTY OBJECT_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/app/assets/easy2gif.ico")
+endif()
+
+qt_add_resources(easy2gif branding
+    PREFIX "/branding"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/app/assets"
+    FILES app/assets/easy2gif.png)
+
 # Rust is already stripped; drop the final MinGW symbol table in Release too.
 if(MINGW)
     target_link_options(easy2gif PRIVATE "$<$<CONFIG:Release>:-s>")

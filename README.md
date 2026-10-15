@@ -1,6 +1,13 @@
 # Easy2GIF
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.svg">
+  <img src="docs/brand/logo-light.svg" alt="Easy2GIF 徽标" width="360">
+</picture>
+
 把视频片段变成 GIF，让分享更简单。
+
+![Windows x64](docs/brand/platform.svg) ![Rust 与 Qt Quick](docs/brand/stack.svg) ![本地处理](docs/brand/local.svg)
 
 Easy2GIF 是一款适用于 **Windows x64** 的视频转 GIF 工具。预览画面、选择片段、调整参数，即可导出动画。免安装，视频在本地处理，无需上传，也无需另行安装 FFmpeg。
 
@@ -100,9 +107,10 @@ rustup toolchain install stable-x86_64-pc-windows-gnu
 ```powershell
 .\package.ps1 -SkipBuild              # 将已构建的程序打成 ZIP
 .\package.ps1 -SharedMedia -SevenZip   # 构建并生成 ZIP、7z
+.\package.ps1 -SharedMedia -SevenZipOnly # 构建并只生成 7z
 ```
 
-压缩包与 SHA256 校验文件保存在 `b\releases`。`-SevenZip` 需要支持 7z 格式的 Windows `tar.exe`；省略该参数只生成 ZIP。
+压缩包与 SHA256 校验文件保存在 `b\releases`。`-SevenZip` 和 `-SevenZipOnly` 需要支持 7z 格式的 Windows `tar.exe`；省略这两个参数只生成 ZIP。
 
 ## 第三方组件
 

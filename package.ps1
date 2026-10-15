@@ -4,11 +4,17 @@ param(
     [switch]$SharedMedia,
     [switch]$SkipBuild,
     [switch]$SevenZip,
+    [switch]$SevenZipOnly,
     [string]$QtRoot = 'D:\CODE\QT\6.10.2\mingw_64'
 )
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $bundle = Join-Path $root 'b\bundle'
+if ($SevenZip -and $SevenZipOnly) { throw 'Use either -SevenZip or -SevenZipOnly.' }
+if ($SevenZip -or $SevenZipOnly) {
+    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+    if (!(Test-Path $tar)) { throw '7z packaging requires Windows tar.exe.' }
+}
 if ($SharedMedia -and $SkipBuild) { throw '-SharedMedia requires a build; omit -SkipBuild.' }
 if (!$SkipBuild) {
     $buildArgs = @{ QtRoot = $QtRoot }
@@ -48,6 +54,10 @@ foreach ($file in (Get-Content (Join-Path $bundle 'bin\media-runtime.txt'))) {
     Copy-Item -LiteralPath (Join-Path $bundle "bin\$file") -Destination (Join-Path $app 'bin')
 }
 Copy-Item (Join-Path $bundle 'bin\media-runtime.txt') (Join-Path $app 'bin')
+New-Item -ItemType Directory -Path (Join-Path $app 'branding') | Out-Null
+Get-ChildItem (Join-Path $root 'app\assets') -File | Copy-Item -Destination (Join-Path $app 'branding')
+Get-ChildItem (Join-Path $root 'docs\brand') -Filter 'logo-*.svg' -File |
+    Copy-Item -Destination (Join-Path $app 'branding')
 
 # Read the actual configured media source, including when -SkipBuild is used.
 $cache = Get-Content (Join-Path $root 'b\CMakeCache.txt')
@@ -80,21 +90,23 @@ runs the shipped FFmpeg tools as separate processes. Their licenses apply.
 @{ commit = $commit; dirty = $dirty; builtAtUtc = [DateTime]::UtcNow.ToString('o'); platform = 'windows-x64' } |
     ConvertTo-Json | Set-Content (Join-Path $app 'BUILD.json') -Encoding utf8
 
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-$archive = Join-Path $output "$name.zip"
-if (Test-Path $archive) { throw "Archive already exists: $archive" }
-$level = [IO.Compression.CompressionLevel]::Optimal
-if ([Enum]::GetNames([IO.Compression.CompressionLevel]) -contains 'SmallestSize') {
-    $level = [Enum]::Parse([IO.Compression.CompressionLevel], 'SmallestSize')
+$archives = @()
+if (!$SevenZipOnly) {
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = Join-Path $output "$name.zip"
+    if (Test-Path $archive) { throw "Archive already exists: $archive" }
+    $level = [IO.Compression.CompressionLevel]::Optimal
+    if ([Enum]::GetNames([IO.Compression.CompressionLevel]) -contains 'SmallestSize') {
+        $level = [Enum]::Parse([IO.Compression.CompressionLevel], 'SmallestSize')
+    }
+    [IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, $level, $false)
+    $archives += $archive
 }
-[IO.Compression.ZipFile]::CreateFromDirectory($stage, $archive, $level, $false)
-$archives = @($archive)
-if ($SevenZip) {
-    $tar = Join-Path $env:SystemRoot 'System32\tar.exe'
+if ($SevenZip -or $SevenZipOnly) {
     $seven = Join-Path $output "$name.7z"
     if (Test-Path $seven) { throw "Archive already exists: $seven" }
     & $tar -a -cf $seven -C $stage easy2gif
-    if ($LASTEXITCODE -ne 0) { throw '7z packaging failed; the ZIP is still available.' }
+    if ($LASTEXITCODE -ne 0) { throw '7z packaging failed.' }
     $archives += $seven
 }
 foreach ($path in $archives) {

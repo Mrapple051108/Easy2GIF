@@ -383,18 +383,14 @@ ApplicationWindow {
             Layout.fillWidth: true
             Layout.preferredHeight: 42
             spacing: 12
-            Rectangle {
-                width: 34
-                height: 34
-                radius: 11
-                color: window.primary
-                Text {
-                    anchors.centerIn: parent
-                    text: "E"
-                    color: "#ffffff"
-                    font.pixelSize: 21
-                    font.weight: Font.DemiBold
-                }
+            Image {
+                Layout.preferredWidth: 34
+                Layout.preferredHeight: 34
+                source: "qrc:/branding/easy2gif.png"
+                fillMode: Image.PreserveAspectFit
+                sourceSize.width: 102
+                sourceSize.height: 102
+                Accessible.name: "Easy2GIF"
             }
             UiLabel {
                 text: "Easy2GIF"

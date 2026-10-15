@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QFile>
 #include <QGuiApplication>
+#include <QIcon>
 #include <QImage>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
@@ -95,6 +96,7 @@ int main(int argc, char *argv[])
     app.setApplicationDisplayName(QStringLiteral("Easy2GIF"));
     app.setOrganizationName(QStringLiteral("GifCore"));
     app.setApplicationVersion(QStringLiteral("1.0.0"));
+    app.setWindowIcon(QIcon(QStringLiteral(":/branding/easy2gif.png")));
 
     const Options options = parseArgs(app.arguments());
 
